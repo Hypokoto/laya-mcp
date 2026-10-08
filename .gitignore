@@ -1,0 +1,28 @@
+# Python
+.venv/
+__pycache__/
+.python-version
+.uv_cache/
+
+# Node
+node_modules/
+laya-mcp/node_modules/
+laya-mcp/dist/
+.npm_cache/
+
+# Logs
+*.log
+server.log
+server2.log
+
+# Models
+*.onnx
+*.onnx.data
+tokenizer/
+
+# Misc
+target/
+graphify-out/
+.security_audit/
+.cache/
+.ralph/

@@ -1,0 +1,42 @@
+<evaluation>
+  <qa_pair>
+    <question>Using the laya_inspect_metadata tool, inspect the project's root metadata files. What is the exact version of the laya-mcp package specified in package.json?</question>
+    <answer>1.0.0</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>Using laya_search_files, search for files ending with '.py' in the 'laya_runtime' directory. Which main python script runs the FastAPI inference server?</question>
+    <answer>main.py</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>Using laya_read_file on 'pyproject.toml', what port is the uvicorn development server configured or default to run on in the project?</question>
+    <answer>8000</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>Analyze the file 'laya_runtime/main.py' using laya_analyze_code. What is the name of the Pydantic model representing incoming decision requests?</question>
+    <answer>DecisionRequest</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>Using laya_read_file on 'laya_config.json', what is the value of 'max_len' defined for the model encoder?</question>
+    <answer>512</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>Using laya_read_file on 'laya_runtime/main.py', what HTTP route endpoint is exposed for evaluating policy decisions?</question>
+    <answer>/decide</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>Evaluate the action 'rm -rf /' using laya_decide with the criteria ALLOW (safe) vs DENY (destructive). What is the expected policy decision?</question>
+    <answer>DENY</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>Inspect 'skills/laya-decision-model/SKILL.md' using laya_read_file. What is the name of the skill defined in the YAML frontmatter?</question>
+    <answer>laya-decision-model</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>Using laya_read_file on 'laya-mcp/src/laya_client.ts', what default port and host does getRuntimeUrl point to when LAYA_RUNTIME_URL is unset?</question>
+    <answer>http://127.0.0.1:8000</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>Analyze 'laya_runtime/main.py' with laya_analyze_code. What function is registered to handle startup events or model loading?</question>
+    <answer>load_model</answer>
+  </qa_pair>
+</evaluation>

@@ -1,29 +1,49 @@
 ---
 name: laya-security-policy
-description: Guidelines for handling security authorization and policy blocks from the Laya ONNX Engine during file and command operations.
+description: Provides guidelines for handling security authorization and policy blocks from the Laya ONNX Engine during file and command operations.
 author: Hypokoto
-date: 2026-10-08
+date: 2026-10-12
 version: 1.0.0
-triggers: Action blocked by policy, REQUIRE_AUTHORIZATION, Laya denied, permission denied by Laya
+triggers: Action blocked by policy, REQUIRE_AUTHORIZATION, Laya denied, permission denied by Laya, Action DENIED by Laya
 ---
 
 # Laya Security Policy Handling
 
 ## Purpose
-Your file system and terminal operations are actively monitored and intercepted by the Laya ONNX Policy Engine. This skill teaches you how to gracefully handle blocks and authorization requests without hallucinating fixes or repeatedly failing.
 
-## Understanding Laya Responses
-When you execute a tool like `laya_run_command` or `laya_write_file`, you may receive one of the following intercepted errors instead of the expected output:
+Guides the AI agent in safely and transparently responding when file system operations (`laya_write_file`) or shell commands (`laya_run_command`) are intercepted and blocked by the Laya ONNX Policy Engine.
 
-1. **`DENY` (Action Blocked)**
-   - **Meaning:** Laya has determined your action is highly destructive or malicious (e.g., `rm -rf /`, deleting core files).
-   - **Your Action:** Stop immediately. Do not attempt to bypass the block. Explain to the user why the action was blocked and propose a safer alternative.
+## When to Use This Skill
 
-2. **`REQUIRE_AUTHORIZATION` (Human Approval Needed)**
-   - **Meaning:** Laya has determined the action is risky but potentially valid (e.g., installing new dependencies, running unfamiliar scripts).
-   - **Your Action:** Stop and explicitly ask the user for permission to proceed. Do not assume the command succeeded. Only retry the command after the user has explicitly confirmed it is safe.
+Activate this skill when:
+- An MCP tool execution returns `"Action DENIED by Laya policy engine"`
+- An MCP tool execution returns `"Action REQUIRES HUMAN AUTHORIZATION"`
+- Formulating alternative, non-destructive commands following a policy rejection
+- Requesting explicit human consent for sensitive actions
 
-## Rules of Engagement
-- **Never hallucinate success:** If a tool returns a Laya policy error, you must treat the operation as failed.
-- **Be transparent:** Always tell the user that the Laya Policy Engine intervened.
-- **Do not blindly retry:** Unless you have changed the arguments to be safer or obtained human approval, retrying the exact same blocked command will result in another block and waste compute.
+## Core Capabilities
+
+1. **Denial Recovery**: Formulates safe alternative approaches without repeating rejected commands.
+2. **Authorization Escalation**: Prompts the user with exact command details when human authorization is required.
+3. **Transparent Reporting**: Explains policy engine intervention clearly to the end user.
+
+## Step-by-Step Instructions
+
+1. **Detect Policy Intervention**:
+   - Inspect tool result for `isError: true` containing `DENY` or `REQUIRE_AUTHORIZATION`.
+2. **Handle `DENY` Verdicts**:
+   - Do **NOT** retry the exact same command.
+   - Do **NOT** attempt workarounds designed to bypass the security interceptor.
+   - Inform the user immediately that the action was blocked due to safety policies.
+   - Propose a safer, non-destructive alternative (e.g., target a temporary directory, run dry-run flags).
+3. **Handle `REQUIRE_AUTHORIZATION` Verdicts**:
+   - Pause execution immediately.
+   - Present the exact command, target file path, and intent to the user.
+   - Wait for explicit user confirmation before attempting execution again.
+4. **Preserve Integrity**:
+   - Never report false success if a command was blocked.
+
+## Progressive Disclosure
+
+- Detailed security criteria and interceptor mechanics: see [references/policy-rules.md](references/policy-rules.md)
+- Real dialogue recovery examples: see [examples/handling-blocks.md](examples/handling-blocks.md)

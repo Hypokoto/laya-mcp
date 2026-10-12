@@ -1,7 +1,7 @@
 {
   "name": "laya-mcp",
   "version": "1.0.0",
-  "description": "MCP server for interacting with local project files, commands, and code structure",
+  "description": "Universal Laya ONNX MCP server for agent decision making, security policy enforcement, and code analysis",
   "type": "module",
   "bin": {
     "laya-mcp": "dist/index.js"
@@ -9,9 +9,12 @@
   "main": "dist/index.js",
   "scripts": {
     "start": "node dist/index.js",
+    "start:http": "node dist/index.js --http 3000",
+    "setup": "node dist/index.js setup",
     "dev": "tsx watch src/index.ts",
     "build": "tsc",
-    "clean": "rm -rf dist"
+    "clean": "rm -rf dist",
+    "test": "tsx tests/handshake_test.ts"
   },
   "engines": {
     "node": ">=18"

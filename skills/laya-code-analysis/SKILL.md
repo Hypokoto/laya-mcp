@@ -1,28 +1,43 @@
 ---
 name: laya-code-analysis
-description: Instructions for using Laya's tree-sitter integration to perform deep syntactic and structural codebase analysis.
+description: Analyzes codebase syntax, functions, classes, and symbol references using native tree-sitter AST queries via Laya MCP tools.
 author: Hypokoto
-date: 2026-10-08
+date: 2026-10-12
 version: 1.0.0
-triggers: Analyze code structure, Find usages, tree-sitter analysis, trace this function, find all references
+triggers: Analyze code structure, Find usages, tree-sitter analysis, trace this function, find all references, inspect symbols
 ---
 
 # Laya Code Analysis
 
 ## Purpose
-The Laya MCP Server provides powerful code structural analysis tools backed by native `tree-sitter`. This skill guides you in using these tools to understand complex codebases semantically rather than relying on standard text searches.
 
-## Available Tools
+Guides the AI agent in leveraging Laya's native tree-sitter integration to perform structural, Abstract Syntax Tree (AST)-based code analysis without reading thousands of lines of raw text into the context window.
 
-1. **`laya_analyze_code`**
-   - **Usage:** Extracts structural components like classes, functions, and interfaces from a file.
-   - **When to use:** Use this when you need an overview of a file's architecture without reading the entire source code into your context window. It returns the semantic skeleton of the code.
+## When to Use This Skill
 
-2. **`laya_find_usages`**
-   - **Usage:** Uses tree-sitter query syntax to find exact syntactic references to a specific function or variable.
-   - **When to use:** Use this when you are refactoring a function and need to find every place it is called across the codebase. This is much more accurate than a standard `grep` because it understands the AST (Abstract Syntax Tree).
+Activate this skill when:
+- Exploring new source files to map out classes, methods, and functions
+- Preparing for refactoring where all syntactic references to a symbol must be found
+- Navigating large codebases where standard text-based regex/grep produces false positives
+- Analyzing Python, C, or C++ source structures
 
-## Best Practices
-- **Prefer AST over Regex:** When trying to find function calls or class definitions, always use `laya_find_usages` instead of raw text searching tools.
-- **Context Management:** If a file is extremely large, use `laya_analyze_code` to get the map of functions first, rather than reading thousands of lines of raw text.
-- **Understand Limitations:** The tree-sitter CLI relies on the system having the correct language parsers installed (`/usr/lib/tree_sitter/<lang>.so`). If a language is unsupported, gracefully fall back to standard search methods.
+## Core Capabilities
+
+1. **AST Symbol Extraction**: Parses Python/C/C++ files to extract all defined classes and functions along with exact line numbers.
+2. **Context Window Conservation**: Returns concise symbol skeletons rather than raw file dumps.
+3. **Semantic Reference Discovery**: Queries syntactic AST nodes rather than raw strings.
+
+## Step-by-Step Instructions
+
+1. **Discover File Skeletons**:
+   - Invoke `laya_analyze_code` with `filepath`.
+   - Review the extracted list of `function` and `class` definitions and their line ranges.
+2. **Targeted Reading**:
+   - Instead of reading the entire file, use line-targeted reading or inspect specific functions identified by the analysis.
+3. **Locate Metadata and Dependencies**:
+   - Call `laya_inspect_metadata` to quickly inspect `package.json`, `pyproject.toml`, or `CMakeLists.txt` for dependencies.
+
+## Progressive Disclosure
+
+- Advanced tree-sitter queries and supported language grammars: see [references/tree-sitter-queries.md](references/tree-sitter-queries.md)
+- Real workflow walkthroughs: see [examples/ast-exploration.md](examples/ast-exploration.md)

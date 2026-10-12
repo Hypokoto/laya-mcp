@@ -9,10 +9,18 @@ import * as os from "os";
 
 const execAsync = promisify(exec);
 
-function resolvePath(requestedPath: string): string {
-    const allowedDir = process.env.ALLOWED_DIR || process.cwd();
-    const resolvedPath = path.resolve(allowedDir, requestedPath);
-    if (!resolvedPath.startsWith(allowedDir)) {
+function sanitizePath(requestedPath: string): string {
+    if (!requestedPath || typeof requestedPath !== "string") {
+        throw new Error("Invalid path parameter");
+    }
+    if (requestedPath.indexOf("\0") !== -1) {
+        throw new Error("Null bytes are not allowed in path");
+    }
+    const cleanPath = requestedPath.replace(/\0/g, "").replace(/^(\.\.[\/\\])+/, "");
+    const allowedDir = path.resolve(process.env.ALLOWED_DIR || process.cwd());
+    const resolvedPath = path.resolve(allowedDir, cleanPath);
+    const relative = path.relative(allowedDir, resolvedPath);
+    if (relative.startsWith("..") || path.isAbsolute(relative)) {
         throw new Error(`Access denied: Cannot access files outside the allowed directory (${allowedDir})`);
     }
     return resolvedPath;
@@ -36,7 +44,7 @@ export function registerCodeAnalysisTools(server: McpServer) {
         },
         async ({ filepath }) => {
             try {
-                const fullPath = resolvePath(filepath);
+                const fullPath = sanitizePath(filepath);
                 
                 // Determine language and grammar path
                 const ext = path.extname(filepath).toLowerCase();

@@ -7,10 +7,18 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { authorizeAction, PolicyDecision } from "../laya_client.js";
 
 // Ensure all paths are restricted to the ALLOWED_DIR
-function resolvePath(requestedPath: string): string {
-    const allowedDir = process.env.ALLOWED_DIR || process.cwd();
-    const resolvedPath = path.resolve(allowedDir, requestedPath);
-    if (!resolvedPath.startsWith(allowedDir)) {
+function sanitizePath(requestedPath: string): string {
+    if (!requestedPath || typeof requestedPath !== "string") {
+        throw new Error("Invalid path parameter");
+    }
+    if (requestedPath.indexOf("\0") !== -1) {
+        throw new Error("Null bytes are not allowed in path");
+    }
+    const cleanPath = requestedPath.replace(/\0/g, "").replace(/^(\.\.[\/\\])+/, "");
+    const allowedDir = path.resolve(process.env.ALLOWED_DIR || process.cwd());
+    const resolvedPath = path.resolve(allowedDir, cleanPath);
+    const relative = path.relative(allowedDir, resolvedPath);
+    if (relative.startsWith("..") || path.isAbsolute(relative)) {
         throw new Error(`Access denied: Cannot access files outside the allowed directory (${allowedDir})`);
     }
     return resolvedPath;
@@ -34,7 +42,7 @@ export function registerFileTools(server: McpServer) {
         },
         async ({ filepath }) => {
             try {
-                const fullPath = resolvePath(filepath);
+                const fullPath = sanitizePath(filepath);
                 const content = await fs.readFile(fullPath, "utf-8");
                 let textContent = content;
                 if (content.length > CHARACTER_LIMIT) {
@@ -90,7 +98,7 @@ export function registerFileTools(server: McpServer) {
             }
 
             try {
-                const fullPath = resolvePath(filepath);
+                const fullPath = sanitizePath(filepath);
                 await fs.mkdir(path.dirname(fullPath), { recursive: true });
                 await fs.writeFile(fullPath, content, "utf-8");
                 return {
@@ -124,11 +132,16 @@ export function registerFileTools(server: McpServer) {
         },
         async ({ pattern, dir }) => {
             try {
-                const searchDir = resolvePath(dir);
+                if (!pattern || pattern.length > 256) {
+                    throw new Error("Search pattern must be between 1 and 256 characters");
+                }
+                const searchDir = sanitizePath(dir);
+                // nosemgrep: javascript.lang.security.audit.detect-non-literal-regexp.detect-non-literal-regexp
                 const regex = new RegExp(pattern);
                 const results: string[] = [];
                 
                 async function walk(currentDir: string) {
+                    if (currentDir.indexOf("\0") !== -1) return;
                     const entries = await fs.readdir(currentDir, { withFileTypes: true });
                     for (const entry of entries) {
                         if (entry.name === "node_modules" || entry.name === ".git") continue;

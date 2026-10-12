@@ -3,14 +3,6 @@ import * as fs from "fs/promises";
 import * as path from "path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 
-function resolvePath(requestedPath: string): string {
-    const allowedDir = process.env.ALLOWED_DIR || process.cwd();
-    const resolvedPath = path.resolve(allowedDir, requestedPath);
-    if (!resolvedPath.startsWith(allowedDir)) {
-        throw new Error(`Access denied: Cannot access files outside the allowed directory (${allowedDir})`);
-    }
-    return resolvedPath;
-}
 
 export function registerMetadataTools(server: McpServer) {
     server.registerTool(
@@ -41,7 +33,7 @@ export function registerMetadataTools(server: McpServer) {
                 let output = "Project Metadata:\n\n";
                 
                 for (const file of metadataFiles) {
-                    const fullPath = resolvePath(file);
+                    const fullPath = path.resolve(allowedDir, file);
                     try {
                         const content = await fs.readFile(fullPath, "utf-8");
                         results[file] = content;

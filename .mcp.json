@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "laya": {
+      "command": "node",
+      "args": [
+        "/home/hypokoto/dev/Models/laya-onnx/laya-mcp/dist/index.js"
+      ],
+      "env": {
+        "LAYA_HOME": "/home/hypokoto/dev/Models/laya-onnx",
+        "ALLOWED_DIR": "/home/hypokoto/dev/Models/laya-onnx"
+      }
+    }
+  }
+}

@@ -16,11 +16,10 @@ const fs = require('fs');
 const crypto = require('crypto');
 const os = require('os');
 
-// Strictly whitelisted read-only tools that bypass policy check immediately
-const READONLY_EXACT_RE = /^(view_file|read_file|read|grep|search_files|search_web|read_url_content|list_dir|listdir|ls|glob)$/i;
+const READONLY_EXACT_RE = /^(view_file|read_file|laya_read_file|read_files|laya_read_files|read|grep|search_files|search_web|read_url_content|list_dir|listdir|ls|glob)$/i;
 
 // Self-protection regex for policy engine and harness configurations
-const PROTECTED_TARGETS_RE = /(hooks\/laya-pretool-hook\.js|laya_runtime\/|laya_config\.json|\.claude\/settings\.json|\.gemini\/)/i;
+const PROTECTED_TARGETS_RE = /(hooks\/laya-pretool-hook\.js|laya_runtime\/|laya_config\.json|laya_rules\.json|\.laya\/|\.claude\/settings\.json|\.gemini\/)/i;
 
 /**
  * Sanitizes and truncates tool arguments for policy evaluation.

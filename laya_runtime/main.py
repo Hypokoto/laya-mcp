@@ -129,10 +129,12 @@ class DecisionResponse(BaseModel):
     reasoning: Optional[str] = None
     probability: Optional[float] = None
     probabilities: Optional[Dict[str, float]] = None
+    matched_rule: Optional[str] = None
+    temperature: Optional[float] = None
 
-# Self-protection targets: guard engine files and harness configs against AI self-modification
+# Self-protection targets: guard engine files, rule files, and harness configs against AI self-modification
 PROTECTED_PATHS_RE = re.compile(
-    r"(hooks/laya-pretool-hook\.js|laya_runtime/|laya_config\.json|\.claude/settings\.json|\.gemini/)",
+    r"(hooks/laya-pretool-hook\.js|laya_runtime/|laya_config\.json|laya_rules\.json|\.laya/|\.claude/settings\.json|\.gemini/)",
     re.I
 )
 
@@ -262,6 +264,149 @@ def check_emergency_invariants(tool: str, args: Dict[str, Any]) -> Optional[str]
                 return "REQUIRE_AUTHORIZATION"
     return None
 
+_RULES_CACHE: Dict[str, Any] = {
+    "file_path": None,
+    "mtime": 0.0,
+    "rules": []
+}
+
+def load_user_rules() -> List[Dict[str, Any]]:
+    """Loads declarative policy rules cached by file modification time (mtime).
+    Pre-compiles regex patterns at load time and skips rules with invalid regexes.
+    """
+    global _RULES_CACHE
+    candidate_paths = [
+        os.path.join(BASE_DIR, "..", ".laya", "rules.json"),
+        os.path.join(BASE_DIR, "..", "laya_rules.json"),
+    ]
+    if os.environ.get("LAYA_RULES_PATH"):
+        candidate_paths.insert(0, os.environ["LAYA_RULES_PATH"])
+    if os.environ.get("LAYA_ALLOW_CWD_RULES") == "1":
+        candidate_paths.extend([
+            os.path.join(os.getcwd(), ".laya", "rules.json"),
+            os.path.join(os.getcwd(), "laya_rules.json"),
+        ])
+
+    found_path = None
+    for cp in candidate_paths:
+        if os.path.exists(cp):
+            found_path = cp
+            break
+
+    if not found_path:
+        return []
+
+    try:
+        current_mtime = os.path.getmtime(found_path)
+    except OSError:
+        return []
+
+    if _RULES_CACHE["file_path"] == found_path and _RULES_CACHE["mtime"] == current_mtime:
+        return _RULES_CACHE["rules"]
+
+    compiled_rules = []
+    try:
+        with open(found_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            raw_rules = data.get("rules", []) if isinstance(data, dict) else data
+            if isinstance(raw_rules, list):
+                for r in raw_rules:
+                    if not isinstance(r, dict):
+                        continue
+                    action_raw = r.get("action")
+                    if not isinstance(action_raw, str):
+                        continue
+                    action = action_raw.strip().upper()
+                    if action not in ("ALLOW", "DENY", "REQUIRE_AUTHORIZATION"):
+                        continue
+
+                    rule_entry = {
+                        "name": str(r.get("name") or r.get("id") or "unnamed-rule"),
+                        "action": action,
+                        "tool_re": None,
+                        "cmd_re": None,
+                        "path_re": None
+                    }
+                    try:
+                        tool_pat = r.get("tool") or r.get("toolPattern")
+                        if isinstance(tool_pat, str) and tool_pat:
+                            rule_entry["tool_re"] = re.compile(tool_pat, re.I)
+                        cmd_pat = r.get("commandPattern")
+                        if isinstance(cmd_pat, str) and cmd_pat:
+                            rule_entry["cmd_re"] = re.compile(cmd_pat, re.I)
+                        path_pat = r.get("pathPattern")
+                        if isinstance(path_pat, str) and path_pat:
+                            rule_entry["path_re"] = re.compile(path_pat, re.I)
+
+                        # Security restriction: Broad tool-only ALLOW rules (without a specific commandPattern or pathPattern)
+                        # cannot bypass the neural model or risk-threshold evaluation.
+                        if action == "ALLOW" and not rule_entry["cmd_re"] and not rule_entry["path_re"]:
+                            print(f"Warning: Skipping tool-only ALLOW rule '{rule_entry['name']}': ALLOW rules must specify commandPattern or pathPattern to protect neural evaluation.")
+                            continue
+                        compiled_rules.append(rule_entry)
+                    except Exception as e:
+                        print(f"Warning: Skipping rule '{rule_entry['name']}' in {found_path}: {e}")
+                        continue
+    except Exception as e:
+        print(f"Warning: Failed to load user rules from {found_path}: {e}")
+        return []
+
+    _RULES_CACHE = {
+        "file_path": found_path,
+        "mtime": current_mtime,
+        "rules": compiled_rules
+    }
+    return compiled_rules
+
+def evaluate_user_rules(tool: str, args: Dict[str, Any]) -> Optional[Tuple[str, str]]:
+    """Evaluates declarative policy rules.
+    Matches use cached, pre-compiled regex patterns to avoid disk I/O on the hot path.
+    """
+    rules = load_user_rules()
+    if not rules:
+        return None
+
+    cmd_str = args.get("CommandLine") or args.get("command") or args.get("cmd") or ""
+    raw_fp = args.get("filepath") or args.get("path") or args.get("file_path") or args.get("TargetFile") or ""
+    filepath = raw_fp if isinstance(raw_fp, str) else str(raw_fp) if raw_fp is not None else ""
+
+    canonical_rel_path = filepath
+    is_path_traversal = False
+    if filepath:
+        workspace_dir = os.path.realpath(os.environ.get("ALLOWED_DIR") or os.path.abspath(os.path.join(BASE_DIR, "..")))
+        clean_path = filepath.replace("\0", "")
+        resolved_target = os.path.realpath(os.path.join(workspace_dir, clean_path))
+        try:
+            rel = os.path.relpath(resolved_target, workspace_dir)
+            if rel.startswith("..") or os.path.isabs(rel):
+                is_path_traversal = True
+            else:
+                canonical_rel_path = rel.replace("\\", "/")
+        except (ValueError, OSError):
+            is_path_traversal = True
+
+    for r in rules:
+        if r["tool_re"] and not r["tool_re"].search(tool):
+            continue
+        # Security restriction: A path-only ALLOW rule cannot approve a request that contains a shell command
+        if r["action"] == "ALLOW" and cmd_str and not r["cmd_re"]:
+            continue
+        # Security restriction: An ALLOW rule cannot approve a path traversal attempt outside workspace
+        if r["action"] == "ALLOW" and is_path_traversal:
+            continue
+        if r["cmd_re"] and (not cmd_str or not r["cmd_re"].search(cmd_str)):
+            continue
+        if r["path_re"]:
+            if not filepath:
+                continue
+            if not r["path_re"].search(canonical_rel_path) and not r["path_re"].search(filepath):
+                continue
+            if r["action"] == "ALLOW" and not r["path_re"].search(canonical_rel_path):
+                continue
+        return r["action"], r["name"]
+
+    return None
+
 # --- Decision Endpoint ---
 @app.post("/decide", response_model=DecisionResponse)
 def decide(req: DecisionRequest):
@@ -282,14 +427,35 @@ def decide(req: DecisionRequest):
 
     option_keys = list(crit.keys())
 
-    # 2. Emergency Invariants Safety Net (Runs BEFORE truncation check to prevent padding evasion)
+    # 2. Emergency Invariants Safety Net (Strict Supremacy: Runs BEFORE rules and truncation check)
     emergency_verdict = check_emergency_invariants(req.tool, state)
     if emergency_verdict == "DENY":
         return DecisionResponse(
             decision="DENY",
             reasoning="Emergency safety net overrule: caught catastrophic DENY invariant violation.",
             probability=1.0,
-            probabilities={"DENY": 1.0, "ALLOW": 0.0, "REQUIRE_AUTHORIZATION": 0.0}
+            probabilities={"DENY": 1.0, "ALLOW": 0.0, "REQUIRE_AUTHORIZATION": 0.0},
+            matched_rule="EMERGENCY_INVARIANT_DENY",
+            temperature=1.0
+        )
+    elif emergency_verdict == "REQUIRE_AUTHORIZATION":
+        rule_match = evaluate_user_rules(req.tool, state)
+        if rule_match and rule_match[0] == "DENY":
+            return DecisionResponse(
+                decision="DENY",
+                reasoning=f"Matched declarative policy rule '{rule_match[1]}': DENY.",
+                probability=1.0,
+                probabilities={"DENY": 1.0, "ALLOW": 0.0, "REQUIRE_AUTHORIZATION": 0.0},
+                matched_rule=rule_match[1],
+                temperature=1.0
+            )
+        return DecisionResponse(
+            decision="REQUIRE_AUTHORIZATION",
+            reasoning="Emergency safety net overrule: self-protection or sensitive action invariant violation.",
+            probability=1.0,
+            probabilities={"DENY": 0.0, "ALLOW": 0.0, "REQUIRE_AUTHORIZATION": 1.0},
+            matched_rule="EMERGENCY_INVARIANT_REQUIRE_AUTH",
+            temperature=1.0
         )
 
     # 3. Build Sequence & Detect Truncation
@@ -300,12 +466,33 @@ def decide(req: DecisionRequest):
         crit=crit
     )
 
-    # Truncation Guardrail: If input exceeds sequence window, escalate to prevent payload hiding
+    # Truncation Guardrail: If input exceeds sequence window, escalate to prevent payload hiding.
+    # Note: Truncated payloads MUST NOT be bypassed by user ALLOW rules.
     if truncated and "REQUIRE_AUTHORIZATION" in option_keys:
         return DecisionResponse(
             decision="REQUIRE_AUTHORIZATION",
             reasoning="Input payload exceeds 512 token context budget; truncated payloads require human authorization.",
-            probability=1.0
+            probability=1.0,
+            probabilities={k: (1.0 if k == "REQUIRE_AUTHORIZATION" else 0.0) for k in option_keys},
+            matched_rule="TRUNCATION_ESCALATION",
+            temperature=1.0
+        )
+
+    # 4. Declarative User Rules (.laya/rules.json / laya_rules.json)
+    # When matched, explicit declarative policy rules override neural inference.
+    rule_match = evaluate_user_rules(req.tool, state)
+    if rule_match:
+        rule_action, rule_name = rule_match
+        prob_dict = {k: (1.0 if k == rule_action else 0.0) for k in option_keys}
+        if rule_action not in prob_dict:
+            prob_dict[rule_action] = 1.0
+        return DecisionResponse(
+            decision=rule_action,
+            reasoning=f"Matched declarative policy rule '{rule_name}': {rule_action}.",
+            probability=1.0,
+            probabilities=prob_dict,
+            matched_rule=rule_name,
+            temperature=1.0
         )
 
     qtype_int = 0 # 0 for choice
@@ -381,7 +568,9 @@ def decide(req: DecisionRequest):
         decision=decision,
         reasoning=reasoning,
         probability=best_prob,
-        probabilities=prob_dict
+        probabilities=prob_dict,
+        matched_rule=None,
+        temperature=T
     )
 
 def start():

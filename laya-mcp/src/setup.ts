@@ -9,6 +9,7 @@
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
+import * as crypto from "crypto";
 import { fileURLToPath } from "url";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -105,6 +106,80 @@ export function getLayaMcpCommand(): { command: string; args: string[]; env: Rec
     };
 }
 
+interface UpsertOptions {
+    harness: HarnessConfigLocation;
+    configPath: string;
+    serverName: string;
+    command: string;
+    args: string[];
+    env?: Record<string, string>;
+    successMessage: string;
+}
+
+function upsertServerEntry(options: UpsertOptions): SetupResult {
+    const { harness, configPath, serverName, command, args, env, successMessage } = options;
+    const dirName = path.dirname(configPath);
+    const exists = fs.existsSync(configPath);
+
+    if (!fs.existsSync(dirName)) {
+        fs.mkdirSync(dirName, { recursive: true });
+    }
+
+    let currentJson: any = {};
+    let origMode = 0o600;
+    if (exists) {
+        const stat = fs.statSync(configPath);
+        origMode = stat.mode & 0o777;
+        const content = fs.readFileSync(configPath, "utf-8");
+        try {
+            currentJson = JSON.parse(content);
+            const origBak = `${configPath}.orig.bak`;
+            if (!fs.existsSync(origBak)) {
+                fs.writeFileSync(origBak, content, { encoding: "utf-8", mode: 0o600 });
+            }
+            fs.writeFileSync(`${configPath}.bak`, content, { encoding: "utf-8", mode: 0o600 });
+        } catch (parseErr: any) {
+            throw new Error(`Failed to parse existing config JSON at ${configPath}: ${parseErr.message}. Aborting to prevent file clobbering.`);
+        }
+    }
+
+    const entry = { command, args, env: env || {} };
+
+    if (harness.format === "continue") {
+        if (!Array.isArray(currentJson.mcpServers)) {
+            currentJson.mcpServers = [];
+        }
+        const existingIdx = currentJson.mcpServers.findIndex((s: any) => s.name === serverName);
+        const continueEntry = { name: serverName, ...entry };
+        if (existingIdx >= 0) {
+            currentJson.mcpServers[existingIdx] = continueEntry;
+        } else {
+            currentJson.mcpServers.push(continueEntry);
+        }
+    } else {
+        if (!currentJson.mcpServers || typeof currentJson.mcpServers !== "object" || Array.isArray(currentJson.mcpServers)) {
+            currentJson.mcpServers = {};
+        }
+        currentJson.mcpServers[serverName] = entry;
+    }
+
+    const tmpFile = `${configPath}.tmp.${Date.now()}.${Math.random().toString(36).slice(2)}`;
+    fs.writeFileSync(tmpFile, JSON.stringify(currentJson, null, 2), { encoding: "utf-8", mode: exists ? origMode : 0o600 });
+    try {
+        fs.renameSync(tmpFile, configPath);
+    } catch (e) {
+        try { fs.unlinkSync(tmpFile); } catch {}
+        throw e;
+    }
+
+    return {
+        harness: harness.name,
+        path: configPath,
+        status: exists ? "configured" : "created",
+        message: successMessage
+    };
+}
+
 /**
  * Configures all detected harnesses on the current system.
  */
@@ -122,67 +197,83 @@ export async function setupAllHarnesses(targetDir?: string): Promise<SetupResult
             const exists = fs.existsSync(configPath);
             const dirExists = fs.existsSync(dirName);
 
-            // If the parent directory exists or the config file already exists, we configure it
             if (exists || dirExists) {
                 try {
-                    if (!fs.existsSync(dirName)) {
-                        fs.mkdirSync(dirName, { recursive: true });
-                    }
-
-                    let currentJson: any = {};
-                    if (exists) {
-                        const content = fs.readFileSync(configPath, "utf-8");
-                        try {
-                            currentJson = JSON.parse(content);
-                            // Create safety backups: retain original pristine backup (.orig.bak) and latest (.bak)
-                            const origBak = `${configPath}.orig.bak`;
-                            if (!fs.existsSync(origBak)) {
-                                fs.writeFileSync(origBak, content, "utf-8");
-                            }
-                            fs.writeFileSync(`${configPath}.bak`, content, "utf-8");
-                        } catch (parseErr: any) {
-                            throw new Error(`Failed to parse existing config JSON at ${configPath}: ${parseErr.message}. Aborting to prevent file clobbering.`);
-                        }
-                    }
-
-                    if (harness.format === "continue") {
-                        if (!Array.isArray(currentJson.mcpServers)) {
-                            currentJson.mcpServers = [];
-                        }
-                        const existingIdx = currentJson.mcpServers.findIndex((s: any) => s.name === "laya-mcp");
-                        const entry = {
-                            name: "laya-mcp",
-                            command: mcpConfig.command,
-                            args: mcpConfig.args,
-                            env: mcpConfig.env
-                        };
-                        if (existingIdx >= 0) {
-                            currentJson.mcpServers[existingIdx] = entry;
-                        } else {
-                            currentJson.mcpServers.push(entry);
-                        }
-                    } else {
-                        // Standard format: { mcpServers: { "laya-mcp": { command, args, env } } }
-                        if (!currentJson.mcpServers || typeof currentJson.mcpServers !== "object") {
-                            currentJson.mcpServers = {};
-                        }
-                        currentJson.mcpServers["laya-mcp"] = {
-                            command: mcpConfig.command,
-                            args: mcpConfig.args,
-                            env: mcpConfig.env
-                        };
-                    }
-
-                    const tmpFile = `${configPath}.tmp.${Date.now()}.${Math.random().toString(36).slice(2)}`;
-                    fs.writeFileSync(tmpFile, JSON.stringify(currentJson, null, 2), "utf-8");
-                    fs.renameSync(tmpFile, configPath);
-
+                    const result = upsertServerEntry({
+                        harness,
+                        configPath,
+                        serverName: "laya-mcp",
+                        command: mcpConfig.command,
+                        args: mcpConfig.args,
+                        env: mcpConfig.env,
+                        successMessage: `Successfully registered laya-mcp in ${harness.name}`
+                    });
+                    results.push(result);
+                    configured = true;
+                    break;
+                } catch (err: any) {
                     results.push({
                         harness: harness.name,
                         path: configPath,
-                        status: exists ? "configured" : "created",
-                        message: `Successfully registered laya-mcp in ${harness.name}`
+                        status: "error",
+                        message: `Error writing config: ${err.message}`
                     });
+                }
+            }
+        }
+
+        if (!configured) {
+            results.push({
+                harness: harness.name,
+                path: harness.configPaths[0],
+                status: "skipped",
+                message: "App directory not found on this machine (not installed)."
+            });
+        }
+    }
+
+    return results;
+}
+
+/**
+ * Configures all detected local harnesses to connect to a remote Laya instance via SSH stdio bridge.
+ */
+export async function setupRemoteHarnesses(remoteTarget: string, remoteAllowedDir?: string): Promise<SetupResult[]> {
+    const results: SetupResult[] = [];
+    const hash = crypto.createHash("sha256").update(remoteTarget).digest("hex").slice(0, 6);
+    const serverName = `laya-remote-${remoteTarget.replace(/[^a-zA-Z0-9_-]/g, "_")}-${hash}`;
+    const quote = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
+    const remoteCmd = remoteAllowedDir
+        ? ["env", `ALLOWED_DIR=${quote(remoteAllowedDir)}`, "laya", "serve"]
+        : ["laya", "serve"];
+    const mcpConfig = {
+        command: "ssh",
+        args: ["-T", "--", remoteTarget, ...remoteCmd],
+        env: {}
+    };
+
+    for (const harness of SUPPORTED_HARNESSES) {
+        let configured = false;
+
+        for (const configPath of harness.configPaths) {
+            if (!configPath || configPath.trim() === "") continue;
+
+            const dirName = path.dirname(configPath);
+            const exists = fs.existsSync(configPath);
+            const dirExists = fs.existsSync(dirName);
+
+            if (exists || dirExists) {
+                try {
+                    const result = upsertServerEntry({
+                        harness,
+                        configPath,
+                        serverName,
+                        command: mcpConfig.command,
+                        args: mcpConfig.args,
+                        env: mcpConfig.env,
+                        successMessage: `Successfully configured SSH stdio bridge (${serverName}) in ${harness.name}`
+                    });
+                    results.push(result);
                     configured = true;
                     break;
                 } catch (err: any) {

@@ -207,6 +207,76 @@ async function runEvaluationSuite() {
         return res.isError === true;
     });
 
+    // Q14: Parallel Multi-File Reader: Read multiple files concurrently
+    await testCase(14, "Parallel File Reader: Read multiple files concurrently (laya_read_files)", async () => {
+        const res = await client.callTool({
+            name: "laya_read_files",
+            arguments: {
+                filepaths: ["laya-mcp/package.json", "laya_config.json"]
+            }
+        }) as any;
+        const sc = res.structuredContent;
+        return sc?.total === 2 && sc?.successful === 2 && sc?.failed === 0 && Array.isArray(sc?.files);
+    });
+
+    // Q15: Error Isolation in Multi-File Reader: Valid file succeeds even if sibling path fails
+    await testCase(15, "Parallel File Reader: Error isolation on path traversal in batch", async () => {
+        const res = await client.callTool({
+            name: "laya_read_files",
+            arguments: {
+                filepaths: ["laya-mcp/package.json", "../../etc/passwd"]
+            }
+        }) as any;
+        const sc = res.structuredContent;
+        return sc?.total === 2 && sc?.successful === 1 && sc?.failed === 1 && sc?.files?.[1]?.isError === true;
+    });
+
+    // Q16: Git Diff: Safely inspect repository changes without raw shell execution
+    await testCase(16, "Git Diff: Safely inspect repository working tree (laya_git_diff)", async () => {
+        const res = await client.callTool({
+            name: "laya_git_diff",
+            arguments: { staged: false }
+        }) as any;
+        const sc = res.structuredContent;
+        return sc !== undefined && typeof sc?.hasChanges === "boolean" && typeof sc?.diff === "string";
+    });
+
+    // Q17: System Diagnostics: Retrieve runtime and engine telemetry
+    await testCase(17, "System Diagnostics: Retrieve runtime, memory, and engine telemetry (laya_system_info)", async () => {
+        const res = await client.callTool({
+            name: "laya_system_info",
+            arguments: {}
+        }) as any;
+        const sc = res.structuredContent;
+        return typeof sc?.nodeVersion === "string" && typeof sc?.memory?.rssMb === "number" && typeof sc?.allowedDir === "string";
+    });
+
+    // Q18: Decision Explanation: Full telemetry, matched rule, and calibrated probabilities
+    await testCase(18, "Decision Explanation: Explain decision with rule telemetry (laya_explain_decision)", async () => {
+        const res = await client.callTool({
+            name: "laya_explain_decision",
+            arguments: {
+                tool: "laya_run_command",
+                args: { command: "git status" }
+            }
+        }) as any;
+        const sc = res.structuredContent;
+        return sc?.decision === "ALLOW" && sc?.matched_rule === "allow-git-queries" && typeof sc?.probabilities === "object";
+    });
+
+    // Q19: Declarative Policy Rule: Match and enforce rule from laya_rules.json
+    await testCase(19, "Declarative Rules: Enforce DENY on protected sensitive env pattern", async () => {
+        const res = await client.callTool({
+            name: "laya_decide",
+            arguments: {
+                tool: "laya_write_file",
+                args: { filepath: "config/.env.production" }
+            }
+        }) as any;
+        const sc = res.structuredContent;
+        return sc?.decision === "DENY" && sc?.matched_rule === "protect-sensitive-env";
+    });
+
     await client.close();
 
     console.log(`\n========================================`);

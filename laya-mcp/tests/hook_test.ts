@@ -77,7 +77,7 @@ async function runHookTestSuite() {
 
     // 1. Fast-Path: Read-Only Tools (view_file, Read, Grep, Glob, LS)
     await check("Fast-path bypass for exact read-only whitelist (view_file, Read, Grep, Glob, LS)", async () => {
-        const tools = ["view_file", "Read", "read_file", "Grep", "grep", "Glob", "LS"];
+        const tools = ["view_file", "Read", "read_file", "laya_read_file", "laya_read_files", "read_files", "Grep", "grep", "Glob", "LS"];
         for (const t of tools) {
             const res = await runHookWithPayload({
                 tool_name: t,

@@ -14,6 +14,10 @@ export interface DecisionRequest {
 export interface DecisionResponse {
     decision: PolicyDecision | string;
     reasoning?: string;
+    probability?: number;
+    probabilities?: Record<string, number>;
+    matched_rule?: string | null;
+    temperature?: number;
     logits?: number[];
     isError?: boolean;
 }

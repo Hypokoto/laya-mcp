@@ -1,0 +1,22 @@
+{
+  "version": "1.0",
+  "description": "Laya Declarative Policy Rules",
+  "rules": [
+    {
+      "id": "allow-git-queries",
+      "action": "ALLOW",
+      "tool": "laya_run_command",
+      "commandPattern": "^git\\s+(status|diff|log|branch|show)($|\\s+)"
+    },
+    {
+      "id": "protect-sensitive-env",
+      "action": "DENY",
+      "pathPattern": ".*(\\.env\\.production|prod\\.secrets|id_rsa).*"
+    },
+    {
+      "id": "require-auth-deploy",
+      "action": "REQUIRE_AUTHORIZATION",
+      "commandPattern": ".*(kubectl|docker\\s+push|helm|terraform).*"
+    }
+  ]
+}

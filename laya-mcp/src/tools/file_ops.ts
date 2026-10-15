@@ -45,8 +45,19 @@ function sanitizePath(requestedPath: string, isWrite = false): string {
 
     // Self-Protection check on mutating actions: protect policy engine files and configs
     if (isWrite) {
-        const PROTECTED_TARGETS_RE = /(hooks\/laya-pretool-hook\.js|laya_runtime\/|laya_config\.json|\.claude\/settings\.json|\.gemini\/)/i;
-        if (PROTECTED_TARGETS_RE.test(cleanPath) || PROTECTED_TARGETS_RE.test(resolvedPath)) {
+        const PROTECTED_TARGETS_RE = /(hooks[/\\]laya-pretool-hook\.js|laya_runtime[/\\]|laya_config\.json|laya_rules\.json|\.laya[/\\]|\.claude[/\\]settings\.json|\.gemini[/\\])/i;
+        const normClean = cleanPath.replace(/\\/g, "/");
+        const relResolved = path.relative(allowedDir, resolvedPath).replace(/\\/g, "/");
+        const effectivePath = fsSync.existsSync(resolvedPath)
+            ? fsSync.realpathSync(resolvedPath)
+            : path.join(realAncestor, path.basename(resolvedPath));
+        const relEffective = path.relative(realAllowed, effectivePath).replace(/\\/g, "/");
+
+        if (
+            PROTECTED_TARGETS_RE.test(normClean) ||
+            PROTECTED_TARGETS_RE.test(relResolved) ||
+            PROTECTED_TARGETS_RE.test(relEffective)
+        ) {
             throw new Error(`Access denied: Modification of Laya policy engine or harness configuration files is restricted.`);
         }
     }
@@ -101,6 +112,121 @@ export function registerFileTools(server: McpServer) {
                     content: [{ type: "text", text: `Error reading file: ${error.message}` }]
                 };
             }
+        }
+    );
+
+    server.registerTool(
+        "laya_read_files",
+        {
+            title: "Read Files (Parallel)",
+            description: "Read the contents of multiple files in parallel with bounded concurrency and path sanitization.",
+            inputSchema: z.object({
+                filepaths: z.array(z.string()).min(1).max(50).describe("List of file paths to read in parallel (relative to project root)")
+            }).strict(),
+            annotations: {
+                readOnlyHint: true,
+                destructiveHint: false,
+                idempotentHint: true,
+                openWorldHint: false
+            }
+        },
+        async ({ filepaths }) => {
+            const TOTAL_BATCH_LIMIT = 100_000;
+            const perFileLimit = Math.min(CHARACTER_LIMIT, Math.floor(TOTAL_BATCH_LIMIT / filepaths.length));
+
+            async function readSingle(fp: string) {
+                try {
+                    const fullPath = sanitizePath(fp, false);
+                    const stat = await fs.stat(fullPath);
+                    const bytesToRead = Math.min(stat.size, perFileLimit);
+
+                    const fh = await fs.open(fullPath, "r");
+                    const buffer = Buffer.alloc(bytesToRead);
+                    try {
+                        await fh.read(buffer, 0, bytesToRead, 0);
+                    } finally {
+                        await fh.close();
+                    }
+
+                    let textContent = buffer.toString("utf-8");
+                    const truncated = stat.size > bytesToRead;
+                    if (truncated) {
+                        if (textContent.endsWith("\ufffd")) {
+                            textContent = textContent.slice(0, -1);
+                        }
+                        textContent += `\n\n... (file truncated: read ${bytesToRead} of ${stat.size} bytes)`;
+                    }
+
+                    return {
+                        filepath: fp,
+                        content: textContent,
+                        size: stat.size,
+                        truncated,
+                        isError: false
+                    };
+                } catch (err: any) {
+                    return {
+                        filepath: fp,
+                        content: "",
+                        size: 0,
+                        truncated: false,
+                        isError: true,
+                        error: err.message
+                    };
+                }
+            }
+
+            const CONCURRENCY_LIMIT = 10;
+            const results: Array<Awaited<ReturnType<typeof readSingle>>> = [];
+            for (let i = 0; i < filepaths.length; i += CONCURRENCY_LIMIT) {
+                const chunk = filepaths.slice(i, i + CONCURRENCY_LIMIT);
+                const chunkResults = await Promise.all(chunk.map(fp => readSingle(fp)));
+                results.push(...chunkResults);
+            }
+
+            let summaryText = `Read ${results.length} files (${results.filter(r => !r.isError).length} succeeded, ${results.filter(r => r.isError).length} failed):\n\n`;
+            let totalAppended = summaryText.length;
+            let budgetHit = false;
+            const structuredFiles: Array<Awaited<ReturnType<typeof readSingle>>> = [];
+
+            for (const r of results) {
+                let entryText = "";
+                if (r.isError) {
+                    entryText = `### ❌ ${r.filepath}\nError: ${r.error}\n\n`;
+                } else {
+                    entryText = `### 📄 ${r.filepath} (${r.size} bytes${r.truncated ? ', truncated' : ''})\n\`\`\`\n${r.content}\n\`\`\`\n\n`;
+                }
+
+                if (budgetHit || totalAppended + entryText.length > TOTAL_BATCH_LIMIT) {
+                    if (!budgetHit) {
+                        summaryText += `\n... (Additional file contents omitted: total batch response reached ${TOTAL_BATCH_LIMIT} character safety limit)\n`;
+                        budgetHit = true;
+                    }
+                    structuredFiles.push({
+                        ...r,
+                        content: "[OMITTED: Batch response limit reached]",
+                        truncated: true
+                    });
+                    continue;
+                }
+                summaryText += entryText;
+                totalAppended += entryText.length;
+                structuredFiles.push(r);
+            }
+
+            const totalFailed = results.filter(r => r.isError).length;
+            const isAllFailed = results.length > 0 && totalFailed === results.length;
+
+            return {
+                isError: isAllFailed,
+                content: [{ type: "text", text: summaryText }],
+                structuredContent: {
+                    total: results.length,
+                    successful: results.filter(r => !r.isError).length,
+                    failed: totalFailed,
+                    files: structuredFiles
+                }
+            };
         }
     );
 

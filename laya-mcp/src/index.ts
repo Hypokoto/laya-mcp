@@ -22,8 +22,9 @@ import { registerCommandTools } from "./tools/command_ops.js";
 import { registerCodeAnalysisTools } from "./tools/code_analysis.js";
 import { registerMetadataTools } from "./tools/metadata.js";
 import { registerDecideTools } from "./tools/decide.js";
+import { registerGitTools } from "./tools/git_ops.js";
 import { isRuntimeHealthy } from "./laya_client.js";
-import { setupAllHarnesses } from "./setup.js";
+import { setupAllHarnesses, setupRemoteHarnesses } from "./setup.js";
 import { installLayaHook, uninstallLayaHook } from "./hook_installer.js";
 
 import { spawn } from "child_process";
@@ -129,12 +130,53 @@ function createLayaMcpServer(): McpServer {
     registerCodeAnalysisTools(server);
     registerMetadataTools(server);
     registerDecideTools(server);
+    registerGitTools(server);
 
     return server;
 }
 
 async function main() {
     const args = process.argv.slice(2);
+
+    // Subcommand: serve (stdio mode explicit alias)
+    let explicitStdio = false;
+    if (args[0] === "serve") {
+        explicitStdio = true;
+        args.shift();
+    }
+
+    // Subcommand: remote setup <user@host> [remote_workspace]
+    if (args[0] === "remote" || args[0] === "remote:setup") {
+        const targetHost = args[1] === "setup" ? args[2] : args[1];
+        if (!targetHost || targetHost.startsWith("-")) {
+            console.error("Usage: laya remote setup <user@host> [remote_workspace_path]");
+            process.exit(1);
+        }
+        const remoteWorkspace = args[1] === "setup" ? args[3] : args[2];
+        console.error(`🔒 Configuring local AI harnesses for remote SSH bridge to ${targetHost}...`);
+        const results = await setupRemoteHarnesses(targetHost, remoteWorkspace);
+        console.log("\n=================================================");
+        console.log(`   Laya Remote SSH Bridge Setup (${targetHost})`);
+        console.log("=================================================");
+        for (const res of results) {
+            const icon = res.status === "configured" || res.status === "created" ? "✅" : res.status === "skipped" ? "⚪" : "❌";
+            console.log(`${icon} ${res.harness}: ${res.message}`);
+            if (res.status !== "skipped") {
+                console.log(`   Config: ${res.path}`);
+            }
+        }
+        console.log("=================================================\n");
+
+        const anyConfigured = results.some((r) => r.status === "configured" || r.status === "created");
+        if (!anyConfigured) {
+            console.error("❌ Failed to configure any AI harness: all detected harnesses were skipped or encountered errors.\n");
+            process.exit(1);
+        }
+
+        console.log("💡 Remote SSH stdio bridge configured. Your AI harness will now securely launch");
+        console.log(`   'ssh -T ${targetHost} laya serve' over an encrypted SSH pipe without open HTTP ports.\n`);
+        process.exit(0);
+    }
 
     // Subcommand: setup harnesses
     if (args.includes("setup") || args.includes("--setup")) {
@@ -190,11 +232,13 @@ async function main() {
 Laya MCP Server — Universal AI Decision & Policy Engine
 
 Usage:
-  npx laya-mcp                Start in standard stdio mode (for Claude Desktop, Cursor, etc.)
-  npx laya-mcp setup          Auto-configure Laya in all installed AI harnesses
-  npx laya-mcp hook:install   Install hardcoded PreToolUse decision hook into Antigravity/Cursor
-  npx laya-mcp hook:uninstall Remove PreToolUse decision hook
-  npx laya-mcp --http [port]  Start HTTP/SSE server (default port: 3000)
+  npx laya-mcp                       Start in standard stdio mode (for Claude Desktop, Cursor, etc.)
+  npx laya-mcp serve                 Explicit alias for stdio mode
+  npx laya-mcp remote setup <u@host> Configure local AI harnesses with an SSH stdio remote bridge
+  npx laya-mcp setup                 Auto-configure local Laya in all installed AI harnesses
+  npx laya-mcp hook:install          Install PreToolUse decision hook into Antigravity/Cursor/Claude
+  npx laya-mcp hook:uninstall        Remove PreToolUse decision hook
+  npx laya-mcp --http [port]         Start HTTP/SSE server (legacy/debugging only)
 
 Options:
   --http, -p [port]     Run HTTP/SSE server on specified port (or PORT env var)
@@ -204,7 +248,7 @@ Options:
   --help, -h            Show this help message
 
 Environment Variables:
-  PORT                  Port for HTTP/SSE server (e.g. 3000)
+  PORT                  Port for HTTP/SSE server (default: 3000)
   LAYA_HOME             Path to laya-onnx repository root
   LAYA_RUNTIME_URL      URL of the Python Laya backend (default: http://127.0.0.1:8000)
   ALLOWED_DIR           Directory root for file/command operations
@@ -219,12 +263,16 @@ Environment Variables:
         console.error("Background warmup error:", err);
     });
 
-    // Check for HTTP/SSE mode
+    // Check for HTTP/SSE mode (explicitStdio forces stdio mode even if PORT is set in environment)
     const httpArgIdx = args.findIndex((a) => a === "--http" || a === "-p");
-    let port = process.env.PORT ? parseInt(process.env.PORT, 10) : null;
-    if (httpArgIdx !== -1) {
-        const nextArg = args[httpArgIdx + 1];
-        port = nextArg && !nextArg.startsWith("-") ? parseInt(nextArg, 10) : (port || 3000);
+    let port: number | null = null;
+    if (!explicitStdio) {
+        if (httpArgIdx !== -1) {
+            const nextArg = args[httpArgIdx + 1];
+            port = nextArg && !nextArg.startsWith("-") ? parseInt(nextArg, 10) : (process.env.PORT ? parseInt(process.env.PORT, 10) : 3000);
+        } else if (process.env.PORT) {
+            port = parseInt(process.env.PORT, 10);
+        }
     }
 
     if (port) {

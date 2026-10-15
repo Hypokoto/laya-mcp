@@ -6,34 +6,41 @@ It features a dual-layer architecture:
 1. **Python Policy Engine (`laya_runtime`)**: An incredibly fast FastAPI backend that runs the 400M parameter Laya ONNX graph via `onnxruntime`.
 2. **TypeScript MCP Server (`laya-mcp`)**: A Model Context Protocol server that intercepts agent actions (file ops, commands) for security checks, and exposes tree-sitter codebase analysis and active decision tools.
 
-## 1. Prerequisites & Model Download
+## ⚡ Quickstart (One-Command Setup)
 
-Before starting the server, you need to download the Laya model weights and tokenizer from HuggingFace.
+To automatically provision the Python environment, download model weights (~1.7GB), compile the TypeScript MCP server, register your installed AI harnesses, and run verification:
 
 ```bash
-# Clone this repository
-git clone <your-repo-url>
-cd laya-onnx
-
-# Download the ONNX model files from HuggingFace (receptron/laya-onnx)
-curl -L -o laya.onnx https://huggingface.co/receptron/laya-onnx/resolve/main/laya.onnx
-curl -L -o laya.onnx.data https://huggingface.co/receptron/laya-onnx/resolve/main/laya.onnx.data
-
-# Download the tokenizer
-mkdir -p tokenizer
-curl -L -o tokenizer/tokenizer.json https://huggingface.co/receptron/laya-onnx/resolve/main/tokenizer/tokenizer.json
-curl -L -o tokenizer/tokenizer_config.json https://huggingface.co/receptron/laya-onnx/resolve/main/tokenizer/tokenizer_config.json
+git clone https://github.com/Hypokoto/laya-mcp.git
+cd laya-mcp
+./install.sh
 ```
 
-*Note: The model files are approximately 1.6GB and are ignored by Git.*
+---
 
-## 2. Installation
+## 🛠 Manual Installation
 
+If you prefer to perform the setup steps manually:
+
+### 1. Download Model Weights
 ```bash
-# Install the Python runtime dependencies using uv
-uv sync
+# Download the ONNX model files from HuggingFace (receptron/laya-onnx)
+curl -L -C - -o laya.onnx https://huggingface.co/receptron/laya-onnx/resolve/main/laya.onnx
+curl -L -C - -o laya.onnx.data https://huggingface.co/receptron/laya-onnx/resolve/main/laya.onnx.data
 
-# Install the TypeScript MCP server dependencies
+# Download tokenizer files
+mkdir -p tokenizer
+curl -L -C - -o tokenizer/tokenizer.json https://huggingface.co/receptron/laya-onnx/resolve/main/tokenizer/tokenizer.json
+curl -L -C - -o tokenizer/tokenizer_config.json https://huggingface.co/receptron/laya-onnx/resolve/main/tokenizer/tokenizer_config.json
+```
+*Note: The model files are approximately 1.7GB and are ignored by Git.*
+
+### 2. Environment Setup
+```bash
+# Provision Python runtime
+uv sync   # or: python3 -m venv .venv && source .venv/bin/activate && pip install -r requirements
+
+# Build TypeScript MCP Server
 cd laya-mcp
 npm install
 npm run build

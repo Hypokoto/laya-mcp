@@ -99,8 +99,9 @@ function isDestructiveRm(cmd: string): boolean {
 }
 
 function checkEmergencyInvariants(tool: string, args: Record<string, any>): string | null {
-    const cmdStr = String(args.CommandLine || args.command || args.cmd || "");
-    const filepath = String(args.filepath || args.path || args.file_path || args.TargetFile || "");
+    const safeArgs = args && typeof args === "object" ? args : {};
+    const cmdStr = String(safeArgs.CommandLine || safeArgs.command || safeArgs.cmd || "");
+    const filepath = String(safeArgs.filepath || safeArgs.path || safeArgs.file_path || safeArgs.TargetFile || "");
 
     const combinedTarget = `${cmdStr} ${filepath}`;
     if (PROTECTED_PATHS_RE.test(combinedTarget)) {
@@ -111,7 +112,11 @@ function checkEmergencyInvariants(tool: string, args: Record<string, any>): stri
 
     let targetCmd = cmdStr;
     if (!targetCmd && SHELL_TOOL_RE.test(tool)) {
-        targetCmd = JSON.stringify(args);
+        try {
+            targetCmd = JSON.stringify(safeArgs);
+        } catch {
+            targetCmd = String(safeArgs);
+        }
     }
 
     if (targetCmd) {
@@ -278,8 +283,9 @@ class WasmLayaEngine {
         const rules = this.loadUserRules();
         if (!rules.length) return null;
 
-        const cmdStr = String(args.CommandLine || args.command || args.cmd || "");
-        const rawFp = String(args.filepath || args.path || args.file_path || args.TargetFile || "");
+        const safeArgs = args && typeof args === "object" ? args : {};
+        const cmdStr = String(safeArgs.CommandLine || safeArgs.command || safeArgs.cmd || "");
+        const rawFp = String(safeArgs.filepath || safeArgs.path || safeArgs.file_path || safeArgs.TargetFile || "");
 
         let canonicalRelPath = rawFp;
         let isPathTraversal = false;
@@ -367,7 +373,25 @@ class WasmLayaEngine {
         }
         seq.push(this.SEP_ID);
 
-        const serializedState = typeof state === "string" ? state : JSON.stringify(state);
+        let serializedState = "";
+        try {
+            if (typeof state === "string") {
+                serializedState = state;
+            } else {
+                const seen = new WeakSet();
+                serializedState = JSON.stringify(state, (key, value) => {
+                    if (typeof value === "object" && value !== null) {
+                        if (seen.has(value)) return "[Circular]";
+                        seen.add(value);
+                    }
+                    if (typeof value === "bigint") return value.toString();
+                    return value;
+                });
+            }
+        } catch {
+            serializedState = String(state);
+        }
+
         const stateEnc = this.tokenizer.encode(this.scrub(serializedState));
         const room = Math.max(0, maxLen - seq.length - 1);
         const stateIds = stateEnc.ids.slice(0, room).map((id: number) => BigInt(id));
@@ -446,7 +470,7 @@ class WasmLayaEngine {
             throw new Error("WASM engine failed to initialize.");
         }
 
-        const criteria = request.criteria || {
+        const criteria = (request.criteria && Object.keys(request.criteria).length > 0) ? request.criteria : {
             ALLOW: "The action is safe, standard development operation within bounds.",
             DENY: "The action violates security policies, destroys root files, or is clearly harmful.",
             REQUIRE_AUTHORIZATION: "The action is sensitive or alters critical project configuration."

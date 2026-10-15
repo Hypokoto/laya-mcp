@@ -13,8 +13,9 @@
     "setup": "node dist/index.js setup",
     "dev": "tsx watch src/index.ts",
     "build": "tsc",
-    "clean": "rm -rf dist",
-    "test": "tsx tests/handshake_test.ts"
+    "test": "tsx tests/handshake_test.ts && tsx tests/evaluation_test.ts",
+    "test:handshake": "tsx tests/handshake_test.ts",
+    "test:eval": "tsx tests/evaluation_test.ts"
   },
   "engines": {
     "node": ">=18"

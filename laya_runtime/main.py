@@ -100,6 +100,28 @@ class DecisionResponse(BaseModel):
     decision: str
     reasoning: Optional[str] = None
 
+# Dangerous action patterns for policy guardrails
+DESTRUCTIVE_PATTERNS = [
+    "rm -rf /", "rm -rf /*", "rm -rf *", "rm -rf ~", "rm -rf $HOME",
+    "rm -r /", "rm -r /*", "rm -r *",
+    "mkfs", "fdisk", "dd if=/dev/zero", "dd if=/dev/urandom",
+    ":(){ :|:& };:", "chmod -R 777 /", "> /dev/sda"
+]
+
+AUTHORIZATION_PATTERNS = [
+    "| bash", "| sh", "| zsh", "curl -s http", "wget -O- http"
+]
+
+def check_policy_patterns(state_str: str) -> Optional[str]:
+    state_lower = state_str.lower()
+    for pat in DESTRUCTIVE_PATTERNS:
+        if pat.lower() in state_lower:
+            return "DENY"
+    for pat in AUTHORIZATION_PATTERNS:
+        if pat.lower() in state_lower:
+            return "REQUIRE_AUTHORIZATION"
+    return None
+
 # --- Decision Endpoint ---
 @app.post("/decide", response_model=DecisionResponse)
 async def decide(req: DecisionRequest):
@@ -108,6 +130,7 @@ async def decide(req: DecisionRequest):
     # Formulate policy question (use custom if provided, otherwise default to policy)
     ins = req.context if req.context else f"The agent wants to run the tool '{req.tool}'. Is this action safe or highly destructive?"
     state = req.args
+    state_str = serialize_state(state)
     
     if req.criteria:
         crit = req.criteria
@@ -117,6 +140,19 @@ async def decide(req: DecisionRequest):
             "DENY": "The action is highly destructive (e.g. rm -rf, deleting system files) or clearly malicious.",
             "REQUIRE_AUTHORIZATION": "The action is risky but potentially valid (e.g. installing dependencies) and requires human approval."
         }
+    
+    option_keys = list(crit.keys())
+    
+    # Check deterministic security policy guardrails
+    verdict = check_policy_patterns(state_str)
+    if verdict and verdict in option_keys:
+        reasoning = (
+            f"Action classified as {verdict} by Laya policy guardrails: matched sensitive pattern."
+            if verdict == "REQUIRE_AUTHORIZATION"
+            else f"Action DENIED by Laya policy guardrails: highly destructive command or action detected."
+        )
+        print(f"-> Guardrail Decision: {verdict}")
+        return DecisionResponse(decision=verdict, reasoning=reasoning)
     
     seq, markers, option_keys = build_sequence(
         state=state,
@@ -155,3 +191,4 @@ def start():
 
 if __name__ == "__main__":
     start()
+

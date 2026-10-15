@@ -23,6 +23,7 @@ export function registerMetadataTools(server: McpServer) {
                 const allowedDir = process.env.ALLOWED_DIR || process.cwd();
                 const metadataFiles = [
                     "package.json",
+                    "laya-mcp/package.json",
                     "requirements.txt",
                     "pyproject.toml",
                     "CMakeLists.txt",

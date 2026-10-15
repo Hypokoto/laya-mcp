@@ -258,7 +258,7 @@ async function runHookTestSuite() {
             session_id: testSessionId
         };
 
-        // First call: must require authorization (ask, exit 0)
+        // Step 1: PreToolUse invocation triggers authorization prompt (ask, exit 0)
         const res1 = await runHookWithPayload(payload);
         let parsed1: any = {};
         try { parsed1 = JSON.parse(res1.stdout); } catch {}
@@ -271,18 +271,57 @@ async function runHookTestSuite() {
             return false;
         }
 
-        // Second identical call with same session_id: pre-approved! Exits 0 directly without 'ask'
-        const res2 = await runHookWithPayload(payload);
-        let parsed2: any = {};
-        try { parsed2 = JSON.parse(res2.stdout); } catch {}
-        const isCachedPass = res2.code === 0 && parsed2.hookSpecificOutput?.permissionDecision !== "ask";
+        // Step 2: Unapproved retry without confirmation MUST still prompt (no bypass on rejection)
+        const resUnapproved = await runHookWithPayload(payload);
+        let parsedUnapproved: any = {};
+        try { parsedUnapproved = JSON.parse(resUnapproved.stdout); } catch {}
+        const isAskAgain = resUnapproved.code === 0 &&
+            parsedUnapproved.hookSpecificOutput?.permissionDecision === "ask";
 
-        if (!isCachedPass) {
-            console.error(`\n    Second invocation failed session cache bypass: code=${res2.code}, stdout=${res2.stdout}`);
+        if (!isAskAgain) {
+            console.error(`\n    Unapproved action bypassed prompt prematurely: code=${resUnapproved.code}`);
             return false;
         }
 
-        // Third call with DIFFERENT session_id: requires authorization again (session isolation)
+        // Step 2b: Automated / unconfirmed PostToolUse does NOT promote pending action
+        const postUnconfirmedRes = await runHookWithPayload({
+            hook_event_name: "PostToolUse",
+            ...payload
+        });
+        if (postUnconfirmedRes.code !== 0) return false;
+        const resStillUnapproved = await runHookWithPayload(payload);
+        let parsedStillUnapproved: any = {};
+        try { parsedStillUnapproved = JSON.parse(resStillUnapproved.stdout); } catch {}
+        if (parsedStillUnapproved.hookSpecificOutput?.permissionDecision !== "ask") {
+            console.error("\n    PostToolUse without explicit human approval prematurely cached approval!");
+            return false;
+        }
+
+        // Step 3: Tool completes execution with explicit human confirmation; PostToolUse hook records user's confirmed approval
+        const postToolRes = await runHookWithPayload({
+            hook_event_name: "PostToolUse",
+            user_approved: true,
+            ...payload
+        });
+        if (postToolRes.code !== 0) {
+            console.error(`\n    PostToolUse failed to record approval: code=${postToolRes.code}`);
+            return false;
+        }
+
+        // Step 4: Subsequent identical PreToolUse call in same session: pre-approved! Directly exits 0 without 'ask'
+        const resCached = await runHookWithPayload(payload);
+        let parsedCached: any = {};
+        try { parsedCached = JSON.parse(resCached.stdout); } catch {}
+        const isCachedPass = resCached.code === 0 &&
+            resCached.stderr.includes("Action pre-approved in session") &&
+            parsedCached.hookSpecificOutput?.permissionDecision !== "ask";
+
+        if (!isCachedPass) {
+            console.error(`\n    Post-approval invocation failed session cache bypass: code=${resCached.code}, stdout=${resCached.stdout}`);
+            return false;
+        }
+
+        // Step 5: PreToolUse call with DIFFERENT session_id: requires authorization again (session isolation)
         const payloadOtherSession = { ...payload, session_id: `${testSessionId}_diff` };
         const res3 = await runHookWithPayload(payloadOtherSession);
         let parsed3: any = {};
@@ -299,7 +338,56 @@ async function runHookTestSuite() {
         return true;
     });
 
-    // 10. Destructive Command Invariant is Never Cached
+    // 10. Distinct Content Signatures: Content variation requires separate authorization
+    await check("File content variation requires separate authorization (no path-only bypass)", async () => {
+        const testSessionId = `test_sess_content_${Date.now()}`;
+        const writePayload1 = {
+            tool_name: "write_file",
+            tool_input: { filepath: "package.json", content: '{"name": "test-pkg", "version": "1.0.0"}' },
+            session_id: testSessionId
+        };
+        // 1. PreToolUse prompts for sensitive config modification and marks it pending
+        const preRes = await runHookWithPayload(writePayload1);
+        let parsedPre: any = {};
+        try { parsedPre = JSON.parse(preRes.stdout); } catch {}
+        if (parsedPre.decision !== "REQUIRE_AUTHORIZATION") {
+            console.error(`\n    PreToolUse on package.json failed to require authorization: stdout=${preRes.stdout}`);
+            return false;
+        }
+
+        // 2. PostToolUse confirms approval for writePayload1 with explicit human consent
+        const postRes = await runHookWithPayload({ hook_event_name: "PostToolUse", user_approved: true, ...writePayload1 });
+        if (postRes.code !== 0) {
+            console.error(`\n    PostToolUse failed: code=${postRes.code}`);
+            return false;
+        }
+
+        // 3. Identical write MUST produce a cache hit
+        const resSame = await runHookWithPayload(writePayload1);
+        const hasCacheHit = resSame.code === 0 && resSame.stderr.includes("Action pre-approved in session");
+        if (!hasCacheHit) {
+            console.error(`\n    Identical write failed cache hit: code=${resSame.code}, stderr=${resSame.stderr}`);
+            return false;
+        }
+
+        // 4. Writing different content to same path MUST NOT match cached signature
+        const writePayload2 = {
+            tool_name: "write_file",
+            tool_input: { filepath: "package.json", content: '{"name": "test-pkg", "version": "2.0.0"}' },
+            session_id: testSessionId
+        };
+        const resDiff = await runHookWithPayload(writePayload2);
+        let parsedDiff: any = {};
+        try { parsedDiff = JSON.parse(resDiff.stdout); } catch {}
+        const isNotCached = !resDiff.stderr.includes("Action pre-approved in session");
+        if (resDiff.code !== 0 || parsedDiff.decision !== "REQUIRE_AUTHORIZATION" || !isNotCached) {
+            console.error(`\n    Different content write failed authorization check: code=${resDiff.code}, decision=${parsedDiff.decision}, stderr=${resDiff.stderr}`);
+            return false;
+        }
+        return true;
+    });
+
+    // 11. Destructive Command Invariant is Never Cached
     await check("Destructive invariant commands (rm -rf /) are strictly DENIED and never cached", async () => {
         const testSessionId = `test_sess_deny_${Date.now()}`;
         const payload = {
@@ -317,6 +405,21 @@ async function runHookTestSuite() {
         if (res2.code !== 2) return false;
 
         return true;
+    });
+
+    // 12. Destructive Command Invariant with Padding (Truncation Bypass Resistance)
+    await check("Destructive command (rm -rf /) with large padding is strictly DENIED and not converted to ask", async () => {
+        const paddedPayload = {
+            tool_name: "run_command",
+            tool_input: {
+                CommandLine: "rm -rf /",
+                padding: "x".repeat(3000)
+            }
+        };
+        const res = await runHookWithPayload(paddedPayload);
+        let parsed: any = {};
+        try { parsed = JSON.parse(res.stdout); } catch {}
+        return res.code === 2 && (parsed.decision === "DENY" || res.stderr.includes("DENIED"));
     });
 
     console.log(`\n========================================`);

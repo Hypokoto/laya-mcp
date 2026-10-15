@@ -268,18 +268,31 @@ def decide(req: DecisionRequest):
     print(f"Authorizing/Evaluating with Laya Neural Brain: {req.tool} ...")
     state = req.args
 
-    # 1. Synthesize Tool-Specific Dynamic Criteria if not explicitly provided
-    if req.criteria and req.context:
+    # 1. Synthesize Tool-Specific Dynamic Criteria if not explicitly provided or if security options are missing
+    required_security_options = {"ALLOW", "DENY", "REQUIRE_AUTHORIZATION"}
+    is_security_tool = bool(SHELL_TOOL_RE.match(req.tool) or re.search(r"^(write|edit|replace|append|delete|remove|laya_write_file)", req.tool, re.I))
+
+    if req.criteria and req.context and (not is_security_tool or required_security_options.issubset(set(req.criteria.keys()))):
         ins = req.context
         crit = req.criteria
     else:
         dynamic_ins, dynamic_crit = synthesize_dynamic_criteria(req.tool, state)
         ins = req.context if req.context else dynamic_ins
-        crit = req.criteria if req.criteria else dynamic_crit
+        crit = dynamic_crit
 
     option_keys = list(crit.keys())
 
-    # 2. Build Sequence & Detect Truncation
+    # 2. Emergency Invariants Safety Net (Runs BEFORE truncation check to prevent padding evasion)
+    emergency_verdict = check_emergency_invariants(req.tool, state)
+    if emergency_verdict == "DENY":
+        return DecisionResponse(
+            decision="DENY",
+            reasoning="Emergency safety net overrule: caught catastrophic DENY invariant violation.",
+            probability=1.0,
+            probabilities={"DENY": 1.0, "ALLOW": 0.0, "REQUIRE_AUTHORIZATION": 0.0}
+        )
+
+    # 3. Build Sequence & Detect Truncation
     seq, markers, option_keys, truncated = build_sequence(
         state=state,
         qtype_str="choice",

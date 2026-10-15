@@ -57,26 +57,32 @@ function resolveLayaMcpPath() {
 
 /**
  * Computes a deterministic SHA-256 action signature for session authorization caching.
+ * Includes all arguments (e.g. file content, flags) so payload variations produce distinct signatures.
  */
 function computeActionSignature(toolName, toolArgs) {
     const normTool = (toolName || '').toLowerCase().trim();
     const cmd = (toolArgs?.CommandLine || toolArgs?.command || toolArgs?.cmd || '').trim();
     const filePath = (toolArgs?.filepath || toolArgs?.path || toolArgs?.file_path || toolArgs?.TargetFile || '').trim();
-    const sigPayload = (cmd || filePath) ? `${normTool}::${cmd}::${filePath}` : `${normTool}::${JSON.stringify(toolArgs)}`;
+    const argsStr = JSON.stringify(toolArgs || {});
+    const sigPayload = `${normTool}::${cmd}::${filePath}::${argsStr}`;
     return crypto.createHash('sha256').update(sigPayload).digest('hex');
 }
 
 /**
- * Returns path to session authorization cache file in os.tmpdir.
+ * Returns path to session authorization cache file in a private user-owned cache directory (mode 0o700).
  */
 function getSessionCachePath(sessionId) {
     if (!sessionId) return null;
+    const baseCacheDir = process.env.LAYA_CACHE_DIR || path.join(os.homedir(), '.cache', 'laya', 'sessions');
+    try {
+        fs.mkdirSync(baseCacheDir, { mode: 0o700, recursive: true });
+    } catch {}
     const cleanId = String(sessionId).replace(/[^a-zA-Z0-9_-]/g, '_');
-    return path.join(os.tmpdir(), `laya_session_${cleanId}.json`);
+    return path.join(baseCacheDir, `session_${cleanId}.json`);
 }
 
 /**
- * Checks if an action signature was previously approved in this session.
+ * Checks if an action signature was explicitly approved in this session.
  */
 function isActionCachedApproved(sessionId, sig) {
     if (!sessionId || !sig) return false;
@@ -93,25 +99,56 @@ function isActionCachedApproved(sessionId, sig) {
 }
 
 /**
- * Caches an approved action signature for the active session.
+ * Records an action signature as pending human authorization during PreToolUse.
  */
-function cacheApprovedAction(sessionId, sig) {
+function recordPendingAuthorization(sessionId, sig) {
     if (!sessionId || !sig) return;
     try {
         const cacheFile = getSessionCachePath(sessionId);
         if (!cacheFile) return;
-        let data = { approved: [] };
+        let data = { pending: [], approved: [] };
         if (fs.existsSync(cacheFile)) {
             try {
                 data = JSON.parse(fs.readFileSync(cacheFile, 'utf8'));
+                if (!Array.isArray(data.pending)) data.pending = [];
                 if (!Array.isArray(data.approved)) data.approved = [];
             } catch {}
         }
-        if (!data.approved.includes(sig)) {
-            data.approved.push(sig);
+        if (!data.pending.includes(sig)) {
+            data.pending.push(sig);
             fs.writeFileSync(cacheFile, JSON.stringify(data, null, 2), { mode: 0o600 });
         }
     } catch {}
+}
+
+/**
+ * Confirms a pending authorization when PostToolUse verifies successful tool execution.
+ */
+function confirmPendingAuthorization(sessionId, sig) {
+    if (!sessionId || !sig) return false;
+    try {
+        const cacheFile = getSessionCachePath(sessionId);
+        if (!cacheFile || !fs.existsSync(cacheFile)) return false;
+        let data = { pending: [], approved: [] };
+        try {
+            data = JSON.parse(fs.readFileSync(cacheFile, 'utf8'));
+            if (!Array.isArray(data.pending)) data.pending = [];
+            if (!Array.isArray(data.approved)) data.approved = [];
+        } catch {
+            return false;
+        }
+
+        // Only promote if it was genuinely pending authorization
+        if (data.pending.includes(sig)) {
+            data.pending = data.pending.filter((s) => s !== sig);
+            if (!data.approved.includes(sig)) {
+                data.approved.push(sig);
+            }
+            fs.writeFileSync(cacheFile, JSON.stringify(data, null, 2), { mode: 0o600 });
+            return true;
+        }
+    } catch {}
+    return false;
 }
 
 /**
@@ -276,6 +313,31 @@ function main() {
             const parsed = JSON.parse(rawInput);
             const { toolName, toolArgs, sessionId } = normalizePayload(parsed);
 
+            // 0. Confirmed Approval / PostToolUse Recording:
+            // Promote a pending signature ONLY when the harness delivers a genuine post-tool event
+            // AND provides a trustworthy signal of explicit human consent (not automated or default tool execution).
+            const hookEvent = parsed.hook_event_name || parsed.hookEventName || parsed.event || '';
+            const isPostTool = hookEvent === "PostToolUse" || hookEvent === "AfterTool" || hookEvent === "afterToolUse" || hookEvent === "post_tool";
+            const hasExplicitHumanConsent = Boolean(
+                parsed.user_approved === true ||
+                parsed.human_approved === true ||
+                parsed.is_human_confirmed === true ||
+                parsed.permission_decision === "allow" ||
+                process.env.LAYA_TRUST_HARNESS_APPROVAL === "true"
+            );
+
+            if (isPostTool) {
+                const targetStr = JSON.stringify(toolArgs);
+                if (hasExplicitHumanConsent && sessionId && !PROTECTED_TARGETS_RE.test(targetStr)) {
+                    const actionSig = computeActionSignature(toolName, toolArgs);
+                    const confirmed = confirmPendingAuthorization(sessionId, actionSig);
+                    if (confirmed) {
+                        console.error(`Laya Hook: Recorded approved action in session cache (${sessionId.slice(0, 8)}...): ${toolName}`);
+                    }
+                }
+                process.exit(0);
+            }
+
             // 1. Fast-Path: Allow strictly whitelisted read-only tools without latency
             if (READONLY_EXACT_RE.test(toolName)) {
                 process.exit(0);
@@ -293,7 +355,6 @@ function main() {
             if (PROTECTED_TARGETS_RE.test(targetStr)) {
                 const selfProtectMsg = "Action REQUIRES HUMAN AUTHORIZATION: Modification of Laya policy engine or harness configuration files requires explicit confirmation.";
                 console.error(selfProtectMsg);
-                cacheApprovedAction(sessionId, actionSig);
                 const selfProtectPayload = {
                     hookSpecificOutput: {
                         hookEventName: "PreToolUse",
@@ -321,7 +382,7 @@ function main() {
             }
 
             if (decision === 'REQUIRE_AUTHORIZATION') {
-                cacheApprovedAction(sessionId, actionSig);
+                recordPendingAuthorization(sessionId, actionSig);
                 const askMsg = `Action REQUIRES HUMAN AUTHORIZATION by Laya Policy Engine: ${reasoning}`;
                 console.error(askMsg);
                 const askPayload = {

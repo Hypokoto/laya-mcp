@@ -77,18 +77,22 @@ export async function installLayaHook(): Promise<HookInstallResult[]> {
 
                 if (!settings.hooks) settings.hooks = {};
                 if (!Array.isArray(settings.hooks.BeforeTool)) settings.hooks.BeforeTool = [];
+                if (!Array.isArray(settings.hooks.AfterTool)) settings.hooks.AfterTool = [];
 
                 // Check if already registered
-                const exists = settings.hooks.BeforeTool.some((entry: any) =>
+                const beforeExists = settings.hooks.BeforeTool.some((entry: any) =>
+                    entry.hooks?.some((h: any) => h.command?.includes("laya-pretool-hook.js"))
+                );
+                const afterExists = settings.hooks.AfterTool.some((entry: any) =>
                     entry.hooks?.some((h: any) => h.command?.includes("laya-pretool-hook.js"))
                 );
 
-                if (exists) {
+                if (beforeExists && afterExists) {
                     results.push({
                         harness: "Antigravity",
                         path: settingsPath,
                         status: "already_installed",
-                        message: "Laya PreToolUse hook is already registered."
+                        message: "Laya hooks are already registered in BeforeTool and AfterTool."
                     });
                 } else {
                     const hookEntry = {
@@ -102,14 +106,15 @@ export async function installLayaHook(): Promise<HookInstallResult[]> {
                         ]
                     };
 
-                    settings.hooks.BeforeTool.unshift(hookEntry);
+                    if (!beforeExists) settings.hooks.BeforeTool.unshift(hookEntry);
+                    if (!afterExists) settings.hooks.AfterTool.unshift(hookEntry);
                     safeBackupAndAtomicWrite(settingsPath, settings);
 
                     results.push({
                         harness: "Antigravity",
                         path: settingsPath,
                         status: "installed",
-                        message: "Successfully registered Laya PreToolUse hook in BeforeTool array."
+                        message: "Successfully registered Laya hooks in BeforeTool and AfterTool arrays."
                     });
                 }
             } catch (err: any) {
@@ -140,25 +145,27 @@ export async function installLayaHook(): Promise<HookInstallResult[]> {
                 }
                 if (!hooksJson.hooks) hooksJson.hooks = {};
                 if (!Array.isArray(hooksJson.hooks.beforeToolUse)) hooksJson.hooks.beforeToolUse = [];
+                if (!Array.isArray(hooksJson.hooks.afterToolUse)) hooksJson.hooks.afterToolUse = [];
 
-                const already = hooksJson.hooks.beforeToolUse.some((h: any) => h.command?.includes("laya-pretool-hook.js"));
-                if (already) {
+                const beforeCursor = hooksJson.hooks.beforeToolUse.some((h: any) => h.command?.includes("laya-pretool-hook.js"));
+                const afterCursor = hooksJson.hooks.afterToolUse.some((h: any) => h.command?.includes("laya-pretool-hook.js"));
+
+                if (beforeCursor && afterCursor) {
                     results.push({
                         harness: "Cursor",
                         path: cursorPath,
                         status: "already_installed",
-                        message: "Laya hook already present in Cursor hooks.json."
+                        message: "Laya hooks already present in Cursor hooks.json."
                     });
                 } else {
-                    hooksJson.hooks.beforeToolUse.push({
-                        command: `node "${hookScript}"`
-                    });
+                    if (!beforeCursor) hooksJson.hooks.beforeToolUse.push({ command: `node "${hookScript}"` });
+                    if (!afterCursor) hooksJson.hooks.afterToolUse.push({ command: `node "${hookScript}"` });
                     safeBackupAndAtomicWrite(cursorPath, hooksJson);
                     results.push({
                         harness: "Cursor",
                         path: cursorPath,
                         status: "installed",
-                        message: "Registered Laya hook in beforeToolUse."
+                        message: "Registered Laya hooks in beforeToolUse and afterToolUse."
                     });
                 }
             } catch (err: any) {
@@ -183,20 +190,24 @@ export async function installLayaHook(): Promise<HookInstallResult[]> {
             }
             if (!claudeSettings.hooks) claudeSettings.hooks = {};
             if (!Array.isArray(claudeSettings.hooks.PreToolUse)) claudeSettings.hooks.PreToolUse = [];
+            if (!Array.isArray(claudeSettings.hooks.PostToolUse)) claudeSettings.hooks.PostToolUse = [];
 
-            const exists = claudeSettings.hooks.PreToolUse.some((entry: any) =>
+            const preExists = claudeSettings.hooks.PreToolUse.some((entry: any) =>
+                entry.hooks?.some((h: any) => h.command?.includes("laya-pretool-hook.js"))
+            );
+            const postExists = claudeSettings.hooks.PostToolUse.some((entry: any) =>
                 entry.hooks?.some((h: any) => h.command?.includes("laya-pretool-hook.js"))
             );
 
-            if (exists) {
+            if (preExists && postExists) {
                 results.push({
                     harness: "Claude Code",
                     path: claudeSettingsPath,
                     status: "already_installed",
-                    message: "Laya hook already present in Claude Code settings."
+                    message: "Laya hooks already present in Claude Code settings."
                 });
             } else {
-                claudeSettings.hooks.PreToolUse.unshift({
+                const hookEntry = {
                     matcher: ".*",
                     hooks: [
                         {
@@ -205,13 +216,16 @@ export async function installLayaHook(): Promise<HookInstallResult[]> {
                             timeout: 30
                         }
                     ]
-                });
+                };
+
+                if (!preExists) claudeSettings.hooks.PreToolUse.unshift(hookEntry);
+                if (!postExists) claudeSettings.hooks.PostToolUse.unshift(hookEntry);
                 safeBackupAndAtomicWrite(claudeSettingsPath, claudeSettings);
                 results.push({
                     harness: "Claude Code",
                     path: claudeSettingsPath,
                     status: "installed",
-                    message: "Registered Laya PreToolUse hook in Claude Code settings."
+                    message: "Registered Laya PreToolUse and PostToolUse hooks in Claude Code settings."
                 });
             }
         } catch (err: any) {
@@ -244,28 +258,43 @@ export async function uninstallLayaHook(): Promise<HookInstallResult[]> {
         if (fs.existsSync(settingsPath)) {
             try {
                 const settings = JSON.parse(fs.readFileSync(settingsPath, "utf-8"));
+                let modified = false;
+
                 if (settings.hooks?.BeforeTool) {
                     const initialLen = settings.hooks.BeforeTool.length;
                     settings.hooks.BeforeTool = settings.hooks.BeforeTool.filter((entry: any) =>
                         !entry.hooks?.some((h: any) => h.command?.includes("laya-pretool-hook.js"))
                     );
-
                     if (settings.hooks.BeforeTool.length < initialLen) {
-                        safeBackupAndAtomicWrite(settingsPath, settings);
-                        results.push({
-                            harness: "Antigravity",
-                            path: settingsPath,
-                            status: "uninstalled",
-                            message: "Removed Laya PreToolUse hook from BeforeTool array."
-                        });
-                    } else {
-                        results.push({
-                            harness: "Antigravity",
-                            path: settingsPath,
-                            status: "skipped",
-                            message: "Hook was not found in Antigravity settings."
-                        });
+                        modified = true;
                     }
+                }
+
+                if (settings.hooks?.AfterTool) {
+                    const initialLen = settings.hooks.AfterTool.length;
+                    settings.hooks.AfterTool = settings.hooks.AfterTool.filter((entry: any) =>
+                        !entry.hooks?.some((h: any) => h.command?.includes("laya-pretool-hook.js"))
+                    );
+                    if (settings.hooks.AfterTool.length < initialLen) {
+                        modified = true;
+                    }
+                }
+
+                if (modified) {
+                    safeBackupAndAtomicWrite(settingsPath, settings);
+                    results.push({
+                        harness: "Antigravity",
+                        path: settingsPath,
+                        status: "uninstalled",
+                        message: "Removed Laya hooks from BeforeTool and AfterTool arrays."
+                    });
+                } else {
+                    results.push({
+                        harness: "Antigravity",
+                        path: settingsPath,
+                        status: "skipped",
+                        message: "Hook was not found in Antigravity settings."
+                    });
                 }
             } catch (err: any) {
                 results.push({
@@ -289,21 +318,43 @@ export async function uninstallLayaHook(): Promise<HookInstallResult[]> {
         if (fs.existsSync(cursorPath)) {
             try {
                 const hooksJson = JSON.parse(fs.readFileSync(cursorPath, "utf-8"));
+                let modified = false;
+
                 if (hooksJson.hooks?.beforeToolUse) {
                     const initialLen = hooksJson.hooks.beforeToolUse.length;
                     hooksJson.hooks.beforeToolUse = hooksJson.hooks.beforeToolUse.filter((h: any) =>
                         !h.command?.includes("laya-pretool-hook.js")
                     );
-
                     if (hooksJson.hooks.beforeToolUse.length < initialLen) {
-                        safeBackupAndAtomicWrite(cursorPath, hooksJson);
-                        results.push({
-                            harness: "Cursor",
-                            path: cursorPath,
-                            status: "uninstalled",
-                            message: "Removed Laya hook from Cursor hooks.json."
-                        });
+                        modified = true;
                     }
+                }
+
+                if (hooksJson.hooks?.afterToolUse) {
+                    const initialLen = hooksJson.hooks.afterToolUse.length;
+                    hooksJson.hooks.afterToolUse = hooksJson.hooks.afterToolUse.filter((h: any) =>
+                        !h.command?.includes("laya-pretool-hook.js")
+                    );
+                    if (hooksJson.hooks.afterToolUse.length < initialLen) {
+                        modified = true;
+                    }
+                }
+
+                if (modified) {
+                    safeBackupAndAtomicWrite(cursorPath, hooksJson);
+                    results.push({
+                        harness: "Cursor",
+                        path: cursorPath,
+                        status: "uninstalled",
+                        message: "Removed Laya hooks from Cursor hooks.json."
+                    });
+                } else {
+                    results.push({
+                        harness: "Cursor",
+                        path: cursorPath,
+                        status: "skipped",
+                        message: "Hook was not found in Cursor hooks.json."
+                    });
                 }
             } catch (err: any) {
                 results.push({
@@ -322,21 +373,43 @@ export async function uninstallLayaHook(): Promise<HookInstallResult[]> {
     if (fs.existsSync(claudeSettingsPath)) {
         try {
             const claudeSettings = JSON.parse(fs.readFileSync(claudeSettingsPath, "utf-8"));
+            let modified = false;
+
             if (claudeSettings.hooks?.PreToolUse) {
                 const initialLen = claudeSettings.hooks.PreToolUse.length;
                 claudeSettings.hooks.PreToolUse = claudeSettings.hooks.PreToolUse.filter((entry: any) =>
                     !entry.hooks?.some((h: any) => h.command?.includes("laya-pretool-hook.js"))
                 );
-
                 if (claudeSettings.hooks.PreToolUse.length < initialLen) {
-                    safeBackupAndAtomicWrite(claudeSettingsPath, claudeSettings);
-                    results.push({
-                        harness: "Claude Code",
-                        path: claudeSettingsPath,
-                        status: "uninstalled",
-                        message: "Removed Laya PreToolUse hook from Claude Code settings."
-                    });
+                    modified = true;
                 }
+            }
+
+            if (claudeSettings.hooks?.PostToolUse) {
+                const initialLen = claudeSettings.hooks.PostToolUse.length;
+                claudeSettings.hooks.PostToolUse = claudeSettings.hooks.PostToolUse.filter((entry: any) =>
+                    !entry.hooks?.some((h: any) => h.command?.includes("laya-pretool-hook.js"))
+                );
+                if (claudeSettings.hooks.PostToolUse.length < initialLen) {
+                    modified = true;
+                }
+            }
+
+            if (modified) {
+                safeBackupAndAtomicWrite(claudeSettingsPath, claudeSettings);
+                results.push({
+                    harness: "Claude Code",
+                    path: claudeSettingsPath,
+                    status: "uninstalled",
+                    message: "Removed Laya PreToolUse and PostToolUse hooks from Claude Code settings."
+                });
+            } else {
+                results.push({
+                    harness: "Claude Code",
+                    path: claudeSettingsPath,
+                    status: "skipped",
+                    message: "Hook was not found in Claude Code settings."
+                });
             }
         } catch (err: any) {
             results.push({

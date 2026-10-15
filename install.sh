@@ -86,10 +86,22 @@ download_if_missing() {
     fi
 }
 
-download_if_missing "laya.onnx" "${HF_BASE_URL}/laya.onnx"
-download_if_missing "laya.onnx.data" "${HF_BASE_URL}/laya.onnx.data"
-download_if_missing "tokenizer/tokenizer.json" "${HF_BASE_URL}/tokenizer/tokenizer.json"
-download_if_missing "tokenizer/tokenizer_config.json" "${HF_BASE_URL}/tokenizer/tokenizer_config.json"
+if [ ! -f "laya.onnx.data" ] || [ ! -f "laya.onnx" ]; then
+    if command -v hf >/dev/null 2>&1; then
+        echo -e "  ${BLUE}Downloading receptron/laya-onnx via Hugging Face CLI ('hf download')...${NC}"
+        hf download receptron/laya-onnx --local-dir .
+    elif [ -x ".venv/bin/hf" ]; then
+        echo -e "  ${BLUE}Downloading receptron/laya-onnx via Hugging Face CLI ('hf download')...${NC}"
+        .venv/bin/hf download receptron/laya-onnx --local-dir .
+    else
+        download_if_missing "laya.onnx" "${HF_BASE_URL}/laya.onnx"
+        download_if_missing "laya.onnx.data" "${HF_BASE_URL}/laya.onnx.data"
+        download_if_missing "tokenizer/tokenizer.json" "${HF_BASE_URL}/tokenizer/tokenizer.json"
+        download_if_missing "tokenizer/tokenizer_config.json" "${HF_BASE_URL}/tokenizer/tokenizer_config.json"
+    fi
+else
+    echo -e "  ${GREEN}✓${NC} Model assets (laya.onnx, laya.onnx.data) already exist."
+fi
 echo -e "  ${GREEN}✓${NC} Model assets verified."
 
 # --- Step 4: Build TypeScript MCP Server ---

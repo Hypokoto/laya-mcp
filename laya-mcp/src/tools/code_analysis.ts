@@ -1,13 +1,14 @@
 import { z } from "zod";
 import * as fs from "fs/promises";
+import * as fsSync from "fs";
 import * as path from "path";
-import { exec } from "child_process";
+import { execFile } from "child_process";
 import { promisify } from "util";
 import { CHARACTER_LIMIT } from "../constants.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import * as os from "os";
 
-const execAsync = promisify(exec);
+const execFileAsync = promisify(execFile);
 
 function sanitizePath(requestedPath: string): string {
     if (!requestedPath || typeof requestedPath !== "string") {
@@ -19,7 +20,12 @@ function sanitizePath(requestedPath: string): string {
     const cleanPath = requestedPath.replace(/\0/g, "").replace(/^(\.\.[\/\\])+/, "");
     const allowedDir = path.resolve(process.env.ALLOWED_DIR || process.cwd());
     const resolvedPath = path.resolve(allowedDir, cleanPath);
-    const relative = path.relative(allowedDir, resolvedPath);
+    
+    // Check symlink realpath containment if target exists
+    const realAllowed = fsSync.existsSync(allowedDir) ? fsSync.realpathSync(allowedDir) : allowedDir;
+    const realResolved = fsSync.existsSync(resolvedPath) ? fsSync.realpathSync(resolvedPath) : resolvedPath;
+
+    const relative = path.relative(realAllowed, realResolved);
     if (relative.startsWith("..") || path.isAbsolute(relative)) {
         throw new Error(`Access denied: Cannot access files outside the allowed directory (${allowedDir})`);
     }
@@ -75,19 +81,31 @@ export function registerCodeAnalysisTools(server: McpServer) {
                     throw new Error(`Unsupported file extension: ${ext}`);
                 }
                 
-                const grammarPath = `/usr/lib/tree_sitter/${lang}.so`;
+                // Locate tree-sitter grammar library across standard search paths
+                const candidateGrammarPaths = [
+                    process.env.TREE_SITTER_DIR ? path.join(process.env.TREE_SITTER_DIR, `${lang}.so`) : "",
+                    `/usr/lib/tree_sitter/${lang}.so`,
+                    `/usr/local/lib/tree_sitter/${lang}.so`,
+                    `/usr/lib/x86_64-linux-gnu/tree_sitter/${lang}.so`
+                ].filter(Boolean);
                 
-                // Write query to temporary file
-                const queryPath = path.join(os.tmpdir(), `laya_query_${Date.now()}.scm`);
+                const grammarPath = candidateGrammarPaths.find(p => fsSync.existsSync(p)) || candidateGrammarPaths[1];
+                
+                // Secure atomic temporary directory
+                const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "laya-query-"));
+                const queryPath = path.join(tmpDir, "query.scm");
                 await fs.writeFile(queryPath, query, "utf-8");
                 
                 let stdout = "";
                 try {
-                    const result = await execAsync(`tree-sitter query -l ${grammarPath} ${queryPath} "${fullPath}"`);
+                    // Safe execution without shell interpolation (prevents shell injection RCE)
+                    const result = await execFileAsync("tree-sitter", ["query", "-l", grammarPath, queryPath, fullPath], {
+                        timeout: 10000
+                    });
                     stdout = result.stdout;
                 } catch (execError: any) {
                     if (execError.stderr && execError.stderr.includes("dlopen failed")) {
-                        throw new Error(`The tree-sitter-${lang} grammar is not installed. Please run: sudo pacman -S tree-sitter-${lang}`);
+                        throw new Error(`The tree-sitter-${lang} grammar is not installed. Please install tree-sitter-${lang}`);
                     }
                     if (execError.stdout) {
                         stdout = execError.stdout;
@@ -95,7 +113,7 @@ export function registerCodeAnalysisTools(server: McpServer) {
                         throw new Error(execError.stderr || execError.message);
                     }
                 } finally {
-                    await fs.unlink(queryPath).catch(() => {});
+                    await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
                 }
                 
                 // Parse tree-sitter query output

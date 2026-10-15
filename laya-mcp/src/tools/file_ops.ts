@@ -1,12 +1,13 @@
 import { z } from "zod";
 import * as fs from "fs/promises";
+import * as fsSync from "fs";
 import * as path from "path";
 import { CHARACTER_LIMIT } from "../constants.js";
 import { ResponseFormat } from "../types.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { authorizeAction, PolicyDecision } from "../laya_client.js";
 
-// Ensure all paths are restricted to the ALLOWED_DIR
+// Ensure all paths are strictly contained within ALLOWED_DIR, resolving symlinks
 function sanitizePath(requestedPath: string): string {
     if (!requestedPath || typeof requestedPath !== "string") {
         throw new Error("Invalid path parameter");
@@ -17,7 +18,12 @@ function sanitizePath(requestedPath: string): string {
     const cleanPath = requestedPath.replace(/\0/g, "").replace(/^(\.\.[\/\\])+/, "");
     const allowedDir = path.resolve(process.env.ALLOWED_DIR || process.cwd());
     const resolvedPath = path.resolve(allowedDir, cleanPath);
-    const relative = path.relative(allowedDir, resolvedPath);
+
+    // Resolve realpaths to prevent symlink directory escapes
+    const realAllowed = fsSync.existsSync(allowedDir) ? fsSync.realpathSync(allowedDir) : allowedDir;
+    const realResolved = fsSync.existsSync(resolvedPath) ? fsSync.realpathSync(resolvedPath) : resolvedPath;
+
+    const relative = path.relative(realAllowed, realResolved);
     if (relative.startsWith("..") || path.isAbsolute(relative)) {
         throw new Error(`Access denied: Cannot access files outside the allowed directory (${allowedDir})`);
     }
@@ -43,10 +49,23 @@ export function registerFileTools(server: McpServer) {
         async ({ filepath }) => {
             try {
                 const fullPath = sanitizePath(filepath);
-                const content = await fs.readFile(fullPath, "utf-8");
-                let textContent = content;
-                if (content.length > CHARACTER_LIMIT) {
-                    textContent = content.substring(0, CHARACTER_LIMIT) + "\n\n... (file truncated due to size limits)";
+                const stat = await fs.stat(fullPath);
+                
+                // Do not load massive binary files (like 1.7GB model weights) into memory as utf-8
+                const MAX_READ_BYTES = CHARACTER_LIMIT * 4; // ~100KB
+                const bytesToRead = Math.min(stat.size, MAX_READ_BYTES);
+                
+                const fh = await fs.open(fullPath, "r");
+                const buffer = Buffer.alloc(bytesToRead);
+                try {
+                    await fh.read(buffer, 0, bytesToRead, 0);
+                } finally {
+                    await fh.close();
+                }
+
+                let textContent = buffer.toString("utf-8");
+                if (stat.size > bytesToRead) {
+                    textContent += `\n\n... (file truncated: read ${bytesToRead} of ${stat.size} bytes)`;
                 }
                 return {
                     content: [{ type: "text", text: textContent }],

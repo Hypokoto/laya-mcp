@@ -131,11 +131,13 @@ export async function setupAllHarnesses(targetDir?: string): Promise<SetupResult
 
                     let currentJson: any = {};
                     if (exists) {
+                        const content = fs.readFileSync(configPath, "utf-8");
                         try {
-                            const content = fs.readFileSync(configPath, "utf-8");
                             currentJson = JSON.parse(content);
-                        } catch {
-                            currentJson = {};
+                            // Create safety backup before mutating
+                            fs.writeFileSync(`${configPath}.bak`, content, "utf-8");
+                        } catch (parseErr: any) {
+                            throw new Error(`Failed to parse existing config JSON at ${configPath}: ${parseErr.message}. Aborting to prevent file clobbering.`);
                         }
                     }
 

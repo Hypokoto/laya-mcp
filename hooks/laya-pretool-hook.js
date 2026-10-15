@@ -14,11 +14,8 @@ const { spawn } = require('child_process');
 const path = require('path');
 const fs = require('fs');
 
-// Mutating tools that require policy authorization
-const MUTATING_TOOL_RE = /^(run_command|Bash|terminal|write_to_file|replace_file_content|Write|Edit|MultiEdit|create_file|delete_file)/i;
-
-// Read-only tools that bypass policy check immediately
-const READONLY_TOOL_RE = /^(view_file|read_file|Read|grep|search_files|search_web|read_url_content|list_dir|glob)/i;
+// Strictly whitelisted read-only tools that bypass policy check immediately
+const READONLY_EXACT_RE = /^(view_file|read_file|grep|search_files|search_web|read_url_content|list_dir|glob)$/i;
 
 /**
  * Resolves the path to the laya-mcp server entry point.
@@ -188,9 +185,11 @@ async function queryLayaDecide(toolName, toolArgs) {
 function main() {
     let rawInput = '';
     
+    // Fail-closed timeout if harness does not send stdin
     const stdinTimeout = setTimeout(() => {
-        process.exit(0);
-    }, 3000);
+        console.error("Laya PreToolUse Hook Error: Stdin timeout. Failing closed for security.");
+        process.exit(2);
+    }, 5000);
 
     process.stdin.setEncoding('utf8');
     process.stdin.on('data', (chunk) => { rawInput += chunk; });
@@ -198,24 +197,21 @@ function main() {
         clearTimeout(stdinTimeout);
 
         if (!rawInput.trim()) {
-            process.exit(0);
+            console.error("Laya PreToolUse Hook Error: Received empty tool payload. Failing closed for security.");
+            process.exit(2);
         }
 
         try {
             const parsed = JSON.parse(rawInput);
             const { toolName, toolArgs } = normalizePayload(parsed);
 
-            // 1. Fast-Path: Allow read-only tools without latency
-            if (READONLY_TOOL_RE.test(toolName)) {
+            // 1. Fast-Path: Allow strictly whitelisted read-only tools without latency
+            if (READONLY_EXACT_RE.test(toolName)) {
                 process.exit(0);
             }
 
-            // 2. Fast-Path: If not a mutating tool, allow
-            if (!MUTATING_TOOL_RE.test(toolName)) {
-                process.exit(0);
-            }
-
-            // 3. Mutating tool: Evaluate with Laya ONNX Engine
+            // 2. All other tools (mutating, unknown, shell, MCP-namespaced):
+            // Evaluate strictly with Laya ONNX Engine
             const { decision, reasoning } = await queryLayaDecide(toolName, toolArgs);
 
             if (decision === 'ALLOW') {

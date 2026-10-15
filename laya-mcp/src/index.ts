@@ -30,6 +30,7 @@ import { spawn } from "child_process";
 import { fileURLToPath } from "url";
 import { dirname, join, resolve } from "path";
 import * as fs from "fs";
+import crypto from "crypto";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -229,18 +230,54 @@ Environment Variables:
     if (port) {
         const app = express();
 
-        // Enable CORS for browser-based AI agents & web extensions
+        // Host configuration: default to 127.0.0.1 (localhost) to prevent unintended LAN exposure
+        const hostArgIdx = args.findIndex((a) => a === "--host");
+        const host = hostArgIdx !== -1 && args[hostArgIdx + 1]
+            ? args[hostArgIdx + 1]
+            : (process.env.HOST || "127.0.0.1");
+
+        // API Bearer Token: require authentication for remote/network interactions
+        const apiToken = process.env.LAYA_API_TOKEN || crypto.randomBytes(24).toString("hex");
+
+        // Validate Origin & CORS headers (no wildcard *)
         app.use((req, res, next) => {
-            res.setHeader("Access-Control-Allow-Origin", "*");
+            const origin = req.headers.origin;
+            const reqHost = req.headers.host;
+
+            if (origin) {
+                try {
+                    const parsed = new URL(origin);
+                    if (parsed.hostname === "localhost" || parsed.hostname === "127.0.0.1" || parsed.host === reqHost) {
+                        res.setHeader("Access-Control-Allow-Origin", origin);
+                    }
+                } catch {}
+            }
+
             res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-            res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, Bypass-Tunnel-Reminder");
+            res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Session-Id");
             if (req.method === "OPTIONS") {
                 return res.sendStatus(204);
             }
             next();
         });
 
-        // Health endpoint
+        // Authentication middleware for MCP endpoints
+        const requireAuth = (req: express.Request, res: express.Response, next: express.NextFunction) => {
+            const authHeader = req.headers.authorization;
+            const bearer = authHeader?.startsWith("Bearer ") ? authHeader.slice(7) : null;
+            const queryToken = typeof req.query.token === "string" ? req.query.token : null;
+            const provided = bearer || queryToken;
+
+            if (!provided || provided !== apiToken) {
+                return res.status(401).json({
+                    error: "Unauthorized: Missing or invalid API token.",
+                    hint: "Supply Authorization: Bearer <token> or ?token=<token>"
+                });
+            }
+            next();
+        };
+
+        // Health endpoint (public)
         app.get("/health", async (req, res) => {
             const pythonReady = await isRuntimeHealthy();
             res.json({
@@ -251,28 +288,40 @@ Environment Variables:
             });
         });
 
-        let sseTransport: SSEServerTransport | null = null;
+        // Multi-session transport map (isolated per-client McpServer instances)
+        const sseSessions = new Map<string, { transport: SSEServerTransport; server: McpServer }>();
 
-        app.get("/sse", async (req, res) => {
-            sseTransport = new SSEServerTransport("/message", res);
-            await server.connect(sseTransport);
+        app.get("/sse", requireAuth, async (req, res) => {
+            const sessionTransport = new SSEServerTransport("/message", res);
+            const sessionServer = createLayaMcpServer();
+            await sessionServer.connect(sessionTransport);
+
+            const sessionId = sessionTransport.sessionId;
+            sseSessions.set(sessionId, { transport: sessionTransport, server: sessionServer });
+
             req.on("close", () => {
-                console.error("SSE connection closed by client");
+                sseSessions.delete(sessionId);
             });
         });
 
-        app.post("/message", async (req, res) => {
-            if (!sseTransport) {
-                return res.status(400).json({ error: "No active SSE transport connection." });
+        app.post("/message", requireAuth, async (req, res) => {
+            const sessionId = (req.query.sessionId as string) || (req.headers["x-session-id"] as string);
+            const session = sessionId ? sseSessions.get(sessionId) : null;
+
+            if (!session) {
+                return res.status(400).json({ error: `No active SSE transport session found for sessionId '${sessionId}'.` });
             }
-            await sseTransport.handlePostMessage(req, res);
+
+            await session.transport.handlePostMessage(req, res);
         });
 
-        app.listen(port, "0.0.0.0", () => {
-            console.error(`\n🚀 Laya MCP Server running on HTTP/SSE at:`);
-            console.error(`   SSE Endpoint:    http://0.0.0.0:${port}/sse`);
-            console.error(`   Health Status:   http://0.0.0.0:${port}/health`);
-            console.error(`Ready for connections from web harnesses and local agents.\n`);
+        app.listen(port, host, () => {
+            console.error(`\n🔒 Laya MCP Server running on authenticated HTTP/SSE:`);
+            console.error(`   Host & Port:     http://${host}:${port}`);
+            console.error(`   SSE Endpoint:    http://${host}:${port}/sse?token=${apiToken}`);
+            console.error(`   Health Status:   http://${host}:${port}/health`);
+            console.error(`   API Token:       ${apiToken}`);
+            console.error(`Protected against unauthorized network queries and cross-origin access.\n`);
         });
     } else {
         // Standard stdio transport for desktop/CLI harnesses

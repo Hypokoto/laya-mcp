@@ -45,7 +45,11 @@ export function registerCommandTools(server: McpServer) {
 
             try {
                 const allowedDir = process.env.ALLOWED_DIR || process.cwd();
-                const { stdout, stderr } = await execAsync(command, { cwd: allowedDir });
+                const { stdout, stderr } = await execAsync(command, {
+                    cwd: allowedDir,
+                    timeout: 60000, // 60s command execution timeout
+                    maxBuffer: 10 * 1024 * 1024 // 10MB buffer cap
+                });
                 
                 let output = "";
                 if (stdout) output += `STDOUT:\n${stdout}\n`;

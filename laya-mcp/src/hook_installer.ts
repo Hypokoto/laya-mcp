@@ -74,12 +74,12 @@ export async function installLayaHook(): Promise<HookInstallResult[]> {
                     });
                 } else {
                     const hookEntry = {
-                        matcher: "Bash|Edit|Write|MultiEdit|run_command|write_to_file|replace_file_content",
+                        matcher: ".*",
                         hooks: [
                             {
                                 type: "command",
                                 command: `node "${hookScript}"`,
-                                timeout: 15
+                                timeout: 30
                             }
                         ]
                     };
@@ -152,6 +152,57 @@ export async function installLayaHook(): Promise<HookInstallResult[]> {
                 });
             }
             break;
+        }
+    }
+
+    // 3. Claude Code CLI hooks (~/.claude/settings.json)
+    const claudeSettingsPath = path.join(homedir, ".claude", "settings.json");
+    if (fs.existsSync(path.dirname(claudeSettingsPath))) {
+        try {
+            let claudeSettings: any = {};
+            if (fs.existsSync(claudeSettingsPath)) {
+                claudeSettings = JSON.parse(fs.readFileSync(claudeSettingsPath, "utf-8"));
+            }
+            if (!claudeSettings.hooks) claudeSettings.hooks = {};
+            if (!Array.isArray(claudeSettings.hooks.PreToolUse)) claudeSettings.hooks.PreToolUse = [];
+
+            const exists = claudeSettings.hooks.PreToolUse.some((entry: any) =>
+                entry.hooks?.some((h: any) => h.command?.includes("laya-pretool-hook.js"))
+            );
+
+            if (exists) {
+                results.push({
+                    harness: "Claude Code",
+                    path: claudeSettingsPath,
+                    status: "already_installed",
+                    message: "Laya hook already present in Claude Code settings."
+                });
+            } else {
+                claudeSettings.hooks.PreToolUse.unshift({
+                    matcher: ".*",
+                    hooks: [
+                        {
+                            type: "command",
+                            command: `node "${hookScript}"`,
+                            timeout: 30
+                        }
+                    ]
+                });
+                fs.writeFileSync(claudeSettingsPath, JSON.stringify(claudeSettings, null, 2), "utf-8");
+                results.push({
+                    harness: "Claude Code",
+                    path: claudeSettingsPath,
+                    status: "installed",
+                    message: "Registered Laya PreToolUse hook in Claude Code settings."
+                });
+            }
+        } catch (err: any) {
+            results.push({
+                harness: "Claude Code",
+                path: claudeSettingsPath,
+                status: "error",
+                message: `Failed to configure Claude Code settings: ${err.message}`
+            });
         }
     }
 
@@ -244,6 +295,37 @@ export async function uninstallLayaHook(): Promise<HookInstallResult[]> {
                 });
             }
             break;
+        }
+    }
+
+    // 3. Claude Code settings
+    const claudeSettingsPath = path.join(homedir, ".claude", "settings.json");
+    if (fs.existsSync(claudeSettingsPath)) {
+        try {
+            const claudeSettings = JSON.parse(fs.readFileSync(claudeSettingsPath, "utf-8"));
+            if (claudeSettings.hooks?.PreToolUse) {
+                const initialLen = claudeSettings.hooks.PreToolUse.length;
+                claudeSettings.hooks.PreToolUse = claudeSettings.hooks.PreToolUse.filter((entry: any) =>
+                    !entry.hooks?.some((h: any) => h.command?.includes("laya-pretool-hook.js"))
+                );
+
+                if (claudeSettings.hooks.PreToolUse.length < initialLen) {
+                    fs.writeFileSync(claudeSettingsPath, JSON.stringify(claudeSettings, null, 2), "utf-8");
+                    results.push({
+                        harness: "Claude Code",
+                        path: claudeSettingsPath,
+                        status: "uninstalled",
+                        message: "Removed Laya PreToolUse hook from Claude Code settings."
+                    });
+                }
+            }
+        } catch (err: any) {
+            results.push({
+                harness: "Claude Code",
+                path: claudeSettingsPath,
+                status: "error",
+                message: `Error removing Claude Code hook: ${err.message}`
+            });
         }
     }
 

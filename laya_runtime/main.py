@@ -1,34 +1,51 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import Dict, Any, Optional, List
+from contextlib import asynccontextmanager
 import os
+import re
 import json
 import numpy as np
 import uvicorn
 import onnxruntime as ort
 from transformers import AutoTokenizer
 
-app = FastAPI(title="Laya Runtime", description="Decision policy layer for MCP")
-
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_PATH = os.path.join(BASE_DIR, "..", "laya.onnx")
 TOKENIZER_PATH = os.path.join(BASE_DIR, "..", "tokenizer")
+CONFIG_PATH = os.path.join(BASE_DIR, "..", "laya_config.json")
 
 tokenizer = None
 session = None
+config_data = {}
+temperature_by_options = {}
 
-@app.on_event("startup")
-async def load_model():
+if os.path.exists(CONFIG_PATH):
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            config_data = json.load(f)
+            temperature_by_options = config_data.get("temperature_by_options", {})
+    except Exception as e:
+        print(f"Warning: Could not load laya_config.json: {e}")
+
+def load_model():
     global tokenizer, session
     print(f"Loading tokenizer from {TOKENIZER_PATH}...")
     tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_PATH)
     
     print(f"Loading ONNX model from {MODEL_PATH}...")
-    # Use CPU execution provider by default, onnxruntime-opt-rocm will accelerate it if configured
     session = ort.InferenceSession(MODEL_PATH, providers=['CPUExecutionProvider'])
     print("Laya ONNX model successfully loaded.")
 
-# --- Sequence Building (Ported from sequence.ts) ---
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    load_model()
+    yield
+    print("Shutting down Laya ONNX runtime.")
+
+app = FastAPI(title="Laya Runtime", description="Calibrated Decision & Policy Engine", lifespan=lifespan)
+
+# --- Sequence Building ---
 def py_json_dumps(v):
     return json.dumps(v, ensure_ascii=False)
 
@@ -46,15 +63,23 @@ def render_options(qtype_str, crit):
         ]
     return []
 
+def scrub(s: str) -> str:
+    if not isinstance(s, str):
+        s = str(s)
+    # Scrub all special tokens from input strings to prevent sequence forgery
+    if tokenizer and hasattr(tokenizer, "all_special_tokens"):
+        for tok in tokenizer.all_special_tokens:
+            if tok and tok in s:
+                s = s.replace(tok, " ")
+    elif tokenizer and tokenizer.mask_token:
+        s = s.replace(tokenizer.mask_token, " ")
+    return s
+
 def build_sequence(state, qtype_str, ins, crit, max_len=512, head_max_len=192):
     cls_id = tokenizer.cls_token_id
     sep_id = tokenizer.sep_token_id
     mask_id = tokenizer.mask_token_id
-    mask_tok = tokenizer.mask_token
     
-    def scrub(s):
-        return s.replace(mask_tok, " ")
-        
     def encode(text):
         return tokenizer.encode(text, add_special_tokens=False)
         
@@ -79,15 +104,18 @@ def build_sequence(state, qtype_str, ins, crit, max_len=512, head_max_len=192):
         seq.extend(o)
     seq.append(sep_id)
     
+    st_full_ids = encode(scrub(serialize_state(state)))
     room = max(0, max_len - len(seq) - 1)
-    st_ids = encode(scrub(serialize_state(state)))[:room]
+    
+    truncated = len(st_full_ids) > room
+    st_ids = st_full_ids[:room]
     seq.extend(st_ids)
     seq.append(sep_id)
     
     seq = seq[:max_len]
     markers = [m for m in markers if m < max_len]
     
-    return seq, markers, list(crit.keys()) if qtype_str == "choice" else []
+    return seq, markers, list(crit.keys()) if qtype_str == "choice" else [], truncated
 
 # --- API Models ---
 class DecisionRequest(BaseModel):
@@ -99,38 +127,55 @@ class DecisionRequest(BaseModel):
 class DecisionResponse(BaseModel):
     decision: str
     reasoning: Optional[str] = None
+    probability: Optional[float] = None
+    probabilities: Optional[Dict[str, float]] = None
 
-# Dangerous action patterns for policy guardrails
-DESTRUCTIVE_PATTERNS = [
-    "rm -rf /", "rm -rf /*", "rm -rf *", "rm -rf ~", "rm -rf $HOME",
-    "rm -r /", "rm -r /*", "rm -r *",
-    "mkfs", "fdisk", "dd if=/dev/zero", "dd if=/dev/urandom",
-    ":(){ :|:& };:", "chmod -R 777 /", "> /dev/sda"
+# Dangerous action patterns for policy guardrails (normalized regex)
+DESTRUCTIVE_REGEXES = [
+    re.compile(r"rm\s+(-[a-zA-Z]*[rf][a-zA-Z]*\s+)+(/|/\*|~|\$HOME|\*)", re.I),
+    re.compile(r"rm\s+-[a-zA-Z]*r[a-zA-Z]*f*\s+(/|/\*|~|\$HOME|\*)", re.I),
+    re.compile(r"rm\s+-[a-zA-Z]*f[a-zA-Z]*r*\s+(/|/\*|~|\$HOME|\*)", re.I),
+    re.compile(r"find\s+.*\s+-delete\b", re.I),
+    re.compile(r"\b(mkfs|fdisk|parted)\b", re.I),
+    re.compile(r"dd\s+if=/dev/(zero|urandom)\s+of=", re.I),
+    re.compile(r":\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:", re.I),
+    re.compile(r"chmod\s+(-[a-zA-Z]*R\s+)?777\s+/", re.I),
+    re.compile(r">\s*/dev/sd[a-z]", re.I)
 ]
 
-AUTHORIZATION_PATTERNS = [
-    "| bash", "| sh", "| zsh", "curl -s http", "wget -O- http"
+AUTHORIZATION_REGEXES = [
+    re.compile(r"\|\s*(bash|sh|zsh)\b", re.I),
+    re.compile(r"bash\s+<\s*\(", re.I),
+    re.compile(r"(curl|wget)\s+.*(\||;|\&\&)\s*(sh|bash|python|perl)", re.I),
+    re.compile(r"curl\s+-[a-zA-Z]*o\s+\S+;\s*(sh|bash)", re.I)
 ]
 
-def check_policy_patterns(state_str: str) -> Optional[str]:
-    state_lower = state_str.lower()
-    for pat in DESTRUCTIVE_PATTERNS:
-        if pat.lower() in state_lower:
-            return "DENY"
-    for pat in AUTHORIZATION_PATTERNS:
-        if pat.lower() in state_lower:
-            return "REQUIRE_AUTHORIZATION"
+SHELL_TOOL_RE = re.compile(r"^(run_command|Bash|terminal|shell|execute_command)$", re.I)
+
+def check_policy_patterns(tool: str, args: Dict[str, Any]) -> Optional[str]:
+    # Extract command string if available
+    cmd_str = args.get("CommandLine") or args.get("command") or args.get("cmd") or ""
+    if not cmd_str and SHELL_TOOL_RE.match(tool):
+        cmd_str = serialize_state(args)
+
+    # Only run shell command regexes on shell tools or explicit command parameters
+    if cmd_str:
+        normalized_cmd = " ".join(cmd_str.split())
+        for rx in DESTRUCTIVE_REGEXES:
+            if rx.search(normalized_cmd):
+                return "DENY"
+        for rx in AUTHORIZATION_REGEXES:
+            if rx.search(normalized_cmd):
+                return "REQUIRE_AUTHORIZATION"
     return None
 
 # --- Decision Endpoint ---
 @app.post("/decide", response_model=DecisionResponse)
-async def decide(req: DecisionRequest):
+def decide(req: DecisionRequest):
     print(f"Authorizing/Evaluating: {req.tool} ...")
     
-    # Formulate policy question (use custom if provided, otherwise default to policy)
     ins = req.context if req.context else f"The agent wants to run the tool '{req.tool}'. Is this action safe or highly destructive?"
     state = req.args
-    state_str = serialize_state(state)
     
     if req.criteria:
         crit = req.criteria
@@ -143,8 +188,8 @@ async def decide(req: DecisionRequest):
     
     option_keys = list(crit.keys())
     
-    # Check deterministic security policy guardrails
-    verdict = check_policy_patterns(state_str)
+    # 1. Deterministic Security Pattern Guardrails
+    verdict = check_policy_patterns(req.tool, state)
     if verdict and verdict in option_keys:
         reasoning = (
             f"Action classified as {verdict} by Laya policy guardrails: matched sensitive pattern."
@@ -152,14 +197,23 @@ async def decide(req: DecisionRequest):
             else f"Action DENIED by Laya policy guardrails: highly destructive command or action detected."
         )
         print(f"-> Guardrail Decision: {verdict}")
-        return DecisionResponse(decision=verdict, reasoning=reasoning)
+        return DecisionResponse(decision=verdict, reasoning=reasoning, probability=1.0)
     
-    seq, markers, option_keys = build_sequence(
+    # 2. Build Sequence & Detect Truncation
+    seq, markers, option_keys, truncated = build_sequence(
         state=state,
         qtype_str="choice",
         ins=ins,
         crit=crit
     )
+    
+    # Truncation Guardrail: If input exceeds sequence window, escalate to prevent payload hiding
+    if truncated and "REQUIRE_AUTHORIZATION" in option_keys:
+        return DecisionResponse(
+            decision="REQUIRE_AUTHORIZATION",
+            reasoning="Input payload exceeds 512 token context budget; truncated payloads require human authorization.",
+            probability=1.0
+        )
     
     qtype_int = 0 # 0 for choice
     
@@ -171,24 +225,54 @@ async def decide(req: DecisionRequest):
         "qtype": np.array([qtype_int], dtype=np.int64)
     }
     
-    # Run Inference
+    # 3. Model Inference
     outputs = session.run(["logits", "act_probs"], inputs)
     logits = outputs[0][0] # [K]
-    print(f"Logits: {logits}")
     
-    # The logits array has the same length as markers (K).
-    # We find the index of the maximum logit
-    best_idx = int(np.argmax(logits))
+    # 4. Temperature-Calibrated Softmax
+    K = len(option_keys)
+    temp_key = f"choice:{K}"
+    if temp_key not in temperature_by_options:
+        if 3 <= K <= 5:
+            temp_key = "choice:3-5"
+        elif 6 <= K <= 10:
+            temp_key = "choice:6-10"
+        elif K >= 11:
+            temp_key = "choice:11+"
+        else:
+            temp_key = "choice:2"
+            
+    T = float(temperature_by_options.get(temp_key, 1.0))
+    raw_logits = np.array(logits[:K], dtype=np.float64)
+    scaled_logits = raw_logits / max(1e-4, T)
+    
+    exp_logits = np.exp(scaled_logits - np.max(scaled_logits))
+    probs = exp_logits / np.sum(exp_logits)
+    
+    prob_dict = {k: float(probs[i]) for i, k in enumerate(option_keys)}
+    best_idx = int(np.argmax(probs))
     decision = option_keys[best_idx]
+    best_prob = float(probs[best_idx])
     
-    reasoning = f"Laya confidence high for {decision}."
-    print(f"-> Decision: {decision}")
+    # 5. Security Threshold Enforcement (tau = 0.50 default, configurable via LAYA_ALLOW_THRESHOLD)
+    TAU = float(os.getenv("LAYA_ALLOW_THRESHOLD", "0.50"))
+    if decision == "ALLOW" and best_prob < TAU and "REQUIRE_AUTHORIZATION" in option_keys:
+        decision = "REQUIRE_AUTHORIZATION"
+        reasoning = f"Calibrated ALLOW probability {best_prob*100:.1f}% is below security threshold ({TAU*100:.0f}%); escalated to human authorization."
+    else:
+        reasoning = f"Calibrated decision: {decision} ({best_prob*100:.1f}% confidence, temp={T:.2f})."
+        
+    print(f"-> Decision: {decision} (prob={best_prob:.4f}, T={T:.2f})")
     
-    return DecisionResponse(decision=decision, reasoning=reasoning)
+    return DecisionResponse(
+        decision=decision,
+        reasoning=reasoning,
+        probability=best_prob,
+        probabilities=prob_dict
+    )
 
 def start():
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="127.0.0.1", port=8000)
 
 if __name__ == "__main__":
     start()
-

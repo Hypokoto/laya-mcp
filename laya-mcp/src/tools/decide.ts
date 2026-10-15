@@ -30,7 +30,9 @@ export function registerDecideTools(server: McpServer) {
                     criteria
                 });
 
+                const isInfraFailure = decision.reasoning?.includes("unreachable") || decision.reasoning?.includes("warming up");
                 return {
+                    isError: isInfraFailure,
                     content: [
                         {
                             type: "text",
@@ -40,7 +42,7 @@ export function registerDecideTools(server: McpServer) {
                     structuredContent: {
                         decision: decision.decision,
                         reasoning: decision.reasoning,
-                        success: true
+                        success: !isInfraFailure
                     }
                 };
             } catch (error: any) {

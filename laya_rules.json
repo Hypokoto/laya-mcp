@@ -5,7 +5,7 @@
     {
       "id": "allow-git-queries",
       "action": "ALLOW",
-      "tool": "laya_run_command",
+      "tool": "(laya_)?(run_command|Bash|terminal|shell|execute_command)",
       "commandPattern": "^git\\s+(status|diff|log|branch|show)($|\\s+)"
     },
     {

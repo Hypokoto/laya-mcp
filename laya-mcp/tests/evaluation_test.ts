@@ -277,6 +277,24 @@ async function runEvaluationSuite() {
         return sc?.decision === "DENY" && sc?.matched_rule === "protect-sensitive-env";
     });
 
+    // Q20: WebAssembly In-Process Engine: Direct neural inference via onnxruntime-web
+    await testCase(20, "WebAssembly In-Process Engine: Calibrated neural inference via WASM", async () => {
+        const { wasmEngine } = await import("../dist/wasm_engine.js");
+        const res = await wasmEngine.decide({
+            tool: "laya_run_command",
+            args: { command: "npm test" },
+            context: "Evaluate running npm test",
+            criteria: {
+                ALLOW: "Standard developmental build and testing operation.",
+                DENY: "Malicious command execution.",
+                REQUIRE_AUTHORIZATION: "Sensitive action."
+            }
+        });
+        return ["ALLOW", "REQUIRE_AUTHORIZATION", "DENY"].includes(res?.decision as string) &&
+               typeof res?.probability === "number" &&
+               res?.isError === false;
+    });
+
     await client.close();
 
     console.log(`\n========================================`);

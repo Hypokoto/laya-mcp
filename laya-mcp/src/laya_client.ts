@@ -1,3 +1,5 @@
+import { wasmEngine } from "./wasm_engine.js";
+
 export enum PolicyDecision {
     ALLOW = "ALLOW",
     DENY = "DENY",
@@ -54,53 +56,61 @@ export async function waitForRuntime(maxWaitMs: number = 25000): Promise<boolean
 }
 
 /**
- * Calls the local Laya Python runtime to authorize a tool action.
- * If the runtime is still warming up, it briefly waits rather than immediately failing.
+ * Calls the Laya decision engine to authorize a tool action.
+ * Supports dual-runtime execution:
+ * 1. Primary: Python ONNX Engine daemon (if active or configured)
+ * 2. In-Process Fallback: Pure WebAssembly Engine (onnxruntime-web + @huggingface/tokenizers)
  */
 export async function authorizeAction(request: DecisionRequest): Promise<DecisionResponse> {
+    const preferWasm = process.env.LAYA_ENGINE === "wasm" || process.env.LAYA_PREFER_WASM === "1";
+    const forcePython = process.env.LAYA_ENGINE === "python";
+
+    // 1. If WASM is explicitly preferred, execute directly via WebAssembly in-process
+    if (preferWasm) {
+        try {
+            return await wasmEngine.decide(request);
+        } catch (err: any) {
+            console.error(`WASM engine error: ${err.message}. Falling back to Python runtime...`);
+        }
+    }
+
+    // 2. Check if Python runtime is active
     const runtimeUrl = getRuntimeUrl();
+    const pythonHealthy = await isRuntimeHealthy();
 
-    // If runtime is not ready yet, give it up to 15 seconds before failing
-    if (!(await isRuntimeHealthy())) {
-        console.error("Laya runtime is warming up. Awaiting readiness...");
-        const ready = await waitForRuntime(15000);
-        if (!ready) {
-            return {
-                decision: PolicyDecision.DENY,
-                reasoning: "Laya policy engine is still warming up or unreachable at " + runtimeUrl + ". Please retry in a few seconds.",
-                isError: true
-            };
+    if (pythonHealthy) {
+        try {
+            const response = await fetch(`${runtimeUrl}/decide`, {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json"
+                },
+                body: JSON.stringify(request)
+            });
+
+            if (response.ok) {
+                const data = await response.json() as DecisionResponse;
+                data.isError = false;
+                return data;
+            }
+        } catch (error: any) {
+            console.error(`Error connecting to Python runtime: ${error.message}`);
         }
     }
-    
-    try {
-        const response = await fetch(`${runtimeUrl}/decide`, {
-            method: "POST",
-            headers: {
-                "Content-Type": "application/json"
-            },
-            body: JSON.stringify(request)
-        });
 
-        if (!response.ok) {
-            const errText = await response.text();
-            console.error(`Laya runtime returned ${response.status}: ${errText}`);
-            return {
-                decision: PolicyDecision.DENY,
-                reasoning: `Policy engine returned HTTP ${response.status}: ${errText}`,
-                isError: true
-            };
+    // 3. Seamless in-process WebAssembly fallback if Python is offline
+    if (!forcePython) {
+        try {
+            return await wasmEngine.decide(request);
+        } catch (err: any) {
+            console.error(`WASM fallback failed: ${err.message}`);
         }
-
-        const data = await response.json() as DecisionResponse;
-        data.isError = false;
-        return data;
-    } catch (error: any) {
-        console.error(`Error connecting to Laya runtime: ${error.message}`);
-        return {
-            decision: PolicyDecision.DENY,
-            reasoning: `Could not connect to the Laya policy engine: ${error.message}`,
-            isError: true
-        };
     }
+
+    // 4. Return policy DENY if both engines are unavailable
+    return {
+        decision: PolicyDecision.DENY,
+        reasoning: `Both Laya Python engine (unreachable at ${runtimeUrl}) and in-process WebAssembly engine failed.`,
+        isError: true
+    };
 }

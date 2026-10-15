@@ -84,14 +84,21 @@ export function registerMetadataTools(server: McpServer) {
                 ? (isRootless ? "Containerized Sandbox (Rootless)" : "Containerized Sandbox")
                 : "Host Environment";
 
+            const { isRuntimeHealthy } = await import("../laya_client.js");
+            const pythonActive = await isRuntimeHealthy();
+            const activeEngine = pythonActive
+                ? "Python ONNX Runtime (FastAPI loopback, FP32)"
+                : "In-Process WebAssembly (onnxruntime-web, INT8 Quantized)";
+
             const report = [
                 "### Laya System & Model Diagnostics",
                 `- **MCP Server Version**: 1.0.0`,
+                `- **Active Policy Engine**: ${activeEngine}`,
                 `- **Node Version**: ${process.version}`,
                 `- **Platform**: ${process.platform} (${process.arch})`,
                 `- **Allowed Directory**: ${allowedDir}`,
                 `- **Sandbox Environment**: ${sandboxLabel}`,
-                `- **Execution Provider (Static)**: CPUExecutionProvider (ONNX Runtime)`,
+                `- **Execution Provider**: ${pythonActive ? "CPUExecutionProvider" : "WASM (SIMD/Threaded)"}`,
                 `- **Memory Usage (Node RSS)**: ${(memoryUsage.rss / (1024 * 1024)).toFixed(1)} MB`,
                 `- **Memory Usage (Node Heap)**: ${(memoryUsage.heapUsed / (1024 * 1024)).toFixed(1)} MB / ${(memoryUsage.heapTotal / (1024 * 1024)).toFixed(1)} MB`
             ].join("\n");
@@ -99,6 +106,7 @@ export function registerMetadataTools(server: McpServer) {
             return {
                 content: [{ type: "text", text: report }],
                 structuredContent: {
+                    activeEngine,
                     nodeVersion: process.version,
                     platform: process.platform,
                     arch: process.arch,

@@ -24,9 +24,11 @@
     "node": ">=18"
   },
   "dependencies": {
+    "@huggingface/tokenizers": "^0.2.0",
     "@modelcontextprotocol/sdk": "^1.6.1",
     "@types/express": "^5.0.6",
     "express": "^5.2.1",
+    "onnxruntime-web": "^1.30.0",
     "zod": "^3.23.8"
   },
   "devDependencies": {

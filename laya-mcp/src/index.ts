@@ -237,17 +237,31 @@ Environment Variables:
             : (process.env.HOST || "127.0.0.1");
 
         // API Bearer Token: require authentication for remote/network interactions
+        const isTokenGenerated = !process.env.LAYA_API_TOKEN;
         const apiToken = process.env.LAYA_API_TOKEN || crypto.randomBytes(24).toString("hex");
 
-        // Validate Origin & CORS headers (no wildcard *)
-        app.use((req, res, next) => {
-            const origin = req.headers.origin;
-            const reqHost = req.headers.host;
+        function verifyToken(provided: string, expected: string): boolean {
+            const bufA = Buffer.from(provided);
+            const bufB = Buffer.from(expected);
+            if (bufA.length !== bufB.length) return false;
+            return crypto.timingSafeEqual(bufA, bufB);
+        }
 
+        // Host validation & DNS rebinding protection
+        const ALLOWED_HOSTS = new Set(["localhost", "127.0.0.1", "::1", host]);
+
+        app.use((req, res, next) => {
+            const rawHost = req.headers.host || "";
+            const reqHostName = rawHost.split(":")[0];
+            if (reqHostName && !ALLOWED_HOSTS.has(reqHostName)) {
+                return res.status(403).json({ error: "Forbidden: Host header rejected for DNS rebinding protection." });
+            }
+
+            const origin = req.headers.origin;
             if (origin) {
                 try {
                     const parsed = new URL(origin);
-                    if (parsed.hostname === "localhost" || parsed.hostname === "127.0.0.1" || parsed.host === reqHost) {
+                    if (ALLOWED_HOSTS.has(parsed.hostname)) {
                         res.setHeader("Access-Control-Allow-Origin", origin);
                     }
                 } catch {}
@@ -265,13 +279,13 @@ Environment Variables:
         const requireAuth = (req: express.Request, res: express.Response, next: express.NextFunction) => {
             const authHeader = req.headers.authorization;
             const bearer = authHeader?.startsWith("Bearer ") ? authHeader.slice(7) : null;
-            const queryToken = typeof req.query.token === "string" ? req.query.token : null;
-            const provided = bearer || queryToken;
+            const customHeader = typeof req.headers["x-api-token"] === "string" ? req.headers["x-api-token"] : null;
+            const provided = bearer || customHeader;
 
-            if (!provided || provided !== apiToken) {
+            if (!provided || !verifyToken(provided, apiToken)) {
                 return res.status(401).json({
                     error: "Unauthorized: Missing or invalid API token.",
-                    hint: "Supply Authorization: Bearer <token> or ?token=<token>"
+                    hint: "Supply Authorization: Bearer <token>"
                 });
             }
             next();
@@ -294,13 +308,23 @@ Environment Variables:
         app.get("/sse", requireAuth, async (req, res) => {
             const sessionTransport = new SSEServerTransport("/message", res);
             const sessionServer = createLayaMcpServer();
-            await sessionServer.connect(sessionTransport);
-
             const sessionId = sessionTransport.sessionId;
+
+            // Register session before connect to prevent race condition
             sseSessions.set(sessionId, { transport: sessionTransport, server: sessionServer });
 
-            req.on("close", () => {
+            try {
+                await sessionServer.connect(sessionTransport);
+            } catch (err: any) {
                 sseSessions.delete(sessionId);
+                throw err;
+            }
+
+            req.on("close", async () => {
+                sseSessions.delete(sessionId);
+                try {
+                    await sessionServer.close();
+                } catch {}
             });
         });
 
@@ -318,10 +342,13 @@ Environment Variables:
         app.listen(port, host, () => {
             console.error(`\n🔒 Laya MCP Server running on authenticated HTTP/SSE:`);
             console.error(`   Host & Port:     http://${host}:${port}`);
-            console.error(`   SSE Endpoint:    http://${host}:${port}/sse?token=${apiToken}`);
             console.error(`   Health Status:   http://${host}:${port}/health`);
-            console.error(`   API Token:       ${apiToken}`);
-            console.error(`Protected against unauthorized network queries and cross-origin access.\n`);
+            if (isTokenGenerated) {
+                console.error(`   API Token:       ${apiToken}`);
+            } else {
+                console.error(`   API Token:       [CONFIGURED VIA LAYA_API_TOKEN]`);
+            }
+            console.error(`Protected against DNS rebinding, unauthenticated queries, and cross-origin attacks.\n`);
         });
     } else {
         // Standard stdio transport for desktop/CLI harnesses

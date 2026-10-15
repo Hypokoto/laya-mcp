@@ -1,19 +1,34 @@
 #!/bin/bash
 # start_remote.sh
-# Starts the Laya Python runtime and exposes it to the internet via localtunnel.
+# Safely exposes authenticated Laya MCP SSE (port 3000) via localtunnel with mandatory token.
 
-echo "Starting Laya Runtime on port 8000..."
+if [ -z "$LAYA_API_TOKEN" ]; then
+    export LAYA_API_TOKEN="$(openssl rand -hex 24)"
+    echo "🔑 Generated secure LAYA_API_TOKEN: $LAYA_API_TOKEN"
+fi
+
+echo "Starting local services on 127.0.0.1..."
 source .venv/bin/activate
 cd laya_runtime
 python main.py > server.log 2>&1 &
-SERVER_PID=$!
+PYTHON_PID=$!
+cd ..
 
-echo "Waiting for the server to spin up..."
-sleep 5
+sleep 15
 
-echo "Exposing local server via Localtunnel..."
-export npm_config_cache=$(pwd)/../.npm_cache
-npx -y localtunnel --port 8000
+cd laya-mcp
+export PORT=3000
+export HOST="127.0.0.1"
+npm start > ../mcp_server.log 2>&1 &
+MCP_PID=$!
+cd ..
+
+sleep 3
+
+echo "Tunneling authenticated MCP server (port 3000) via localtunnel..."
+echo "⚠️  Never share your LAYA_API_TOKEN with untrusted parties."
+export npm_config_cache=$(pwd)/.npm_cache
+npx -y localtunnel --port 3000
 
 # Cleanup on exit
-kill $SERVER_PID
+kill $PYTHON_PID $MCP_PID

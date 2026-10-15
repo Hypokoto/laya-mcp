@@ -21,13 +21,26 @@ function sanitizePath(requestedPath: string): string {
     const allowedDir = path.resolve(process.env.ALLOWED_DIR || process.cwd());
     const resolvedPath = path.resolve(allowedDir, cleanPath);
     
-    // Check symlink realpath containment if target exists
+    // Check nearest existing ancestor to prevent symlink directory escapes on new/unresolved files
     const realAllowed = fsSync.existsSync(allowedDir) ? fsSync.realpathSync(allowedDir) : allowedDir;
-    const realResolved = fsSync.existsSync(resolvedPath) ? fsSync.realpathSync(resolvedPath) : resolvedPath;
-
-    const relative = path.relative(realAllowed, realResolved);
-    if (relative.startsWith("..") || path.isAbsolute(relative)) {
+    let curr = resolvedPath;
+    while (!fsSync.existsSync(curr)) {
+        const parent = path.dirname(curr);
+        if (parent === curr) break;
+        curr = parent;
+    }
+    const realAncestor = fsSync.existsSync(curr) ? fsSync.realpathSync(curr) : curr;
+    const relAncestor = path.relative(realAllowed, realAncestor);
+    if (relAncestor.startsWith("..") || path.isAbsolute(relAncestor)) {
         throw new Error(`Access denied: Cannot access files outside the allowed directory (${allowedDir})`);
+    }
+
+    if (fsSync.existsSync(resolvedPath)) {
+        const realResolved = fsSync.realpathSync(resolvedPath);
+        const relative = path.relative(realAllowed, realResolved);
+        if (relative.startsWith("..") || path.isAbsolute(relative)) {
+            throw new Error(`Access denied: Cannot access files outside the allowed directory (${allowedDir})`);
+        }
     }
     return resolvedPath;
 }

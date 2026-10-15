@@ -15,6 +15,7 @@ export interface DecisionResponse {
     decision: PolicyDecision | string;
     reasoning?: string;
     logits?: number[];
+    isError?: boolean;
 }
 
 const getRuntimeUrl = () => process.env.LAYA_RUNTIME_URL || "http://127.0.0.1:8000";
@@ -62,7 +63,8 @@ export async function authorizeAction(request: DecisionRequest): Promise<Decisio
         if (!ready) {
             return {
                 decision: PolicyDecision.DENY,
-                reasoning: "Laya policy engine is still warming up or unreachable at " + runtimeUrl + ". Please retry in a few seconds."
+                reasoning: "Laya policy engine is still warming up or unreachable at " + runtimeUrl + ". Please retry in a few seconds.",
+                isError: true
             };
         }
     }
@@ -81,17 +83,20 @@ export async function authorizeAction(request: DecisionRequest): Promise<Decisio
             console.error(`Laya runtime returned ${response.status}: ${errText}`);
             return {
                 decision: PolicyDecision.DENY,
-                reasoning: `Policy engine returned HTTP ${response.status}: ${errText}`
+                reasoning: `Policy engine returned HTTP ${response.status}: ${errText}`,
+                isError: true
             };
         }
 
         const data = await response.json() as DecisionResponse;
+        data.isError = false;
         return data;
     } catch (error: any) {
         console.error(`Error connecting to Laya runtime: ${error.message}`);
         return {
             decision: PolicyDecision.DENY,
-            reasoning: `Could not connect to the Laya policy engine: ${error.message}`
+            reasoning: `Could not connect to the Laya policy engine: ${error.message}`,
+            isError: true
         };
     }
 }

@@ -7,6 +7,8 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import * as path from "path";
+import * as fs from "fs";
+import * as os from "os";
 import { fileURLToPath } from "url";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -165,6 +167,42 @@ async function runEvaluationSuite() {
         const res = await client.callTool({
             name: "laya_read_file",
             arguments: { filepath: "../../etc/passwd" }
+        }) as any;
+        return res.isError === true;
+    });
+
+    // Q12: Symlink Directory Escape on Non-Existent Target
+    await testCase(12, "Security Boundary: Block symlink escape on non-existent new file", async () => {
+        const outsideDir = fs.mkdtempSync(path.join(os.tmpdir(), "laya-escape-target-"));
+        const symlinkName = "test_symlink_escape_dir";
+        const symlinkPath = path.resolve(process.env.ALLOWED_DIR || path.resolve(__dirname, "../.."), symlinkName);
+        try {
+            if (fs.existsSync(symlinkPath)) fs.unlinkSync(symlinkPath);
+            fs.symlinkSync(outsideDir, symlinkPath, "dir");
+
+            const res = await client.callTool({
+                name: "laya_write_file",
+                arguments: {
+                    filepath: `${symlinkName}/pwned_nonexistent.txt`,
+                    content: "malicious"
+                }
+            }) as any;
+
+            return res.isError === true;
+        } finally {
+            try { if (fs.existsSync(symlinkPath)) fs.unlinkSync(symlinkPath); } catch {}
+            try { fs.rmSync(outsideDir, { recursive: true, force: true }); } catch {}
+        }
+    });
+
+    // Q13: Self-Protection: Reject modification of policy engine or hook files
+    await testCase(13, "Self-Protection: Block mutating write to hooks/laya-pretool-hook.js", async () => {
+        const res = await client.callTool({
+            name: "laya_write_file",
+            arguments: {
+                filepath: "hooks/laya-pretool-hook.js",
+                content: "malicious_override()"
+            }
         }) as any;
         return res.isError === true;
     });

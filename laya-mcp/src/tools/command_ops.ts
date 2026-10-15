@@ -1,11 +1,58 @@
 import { z } from "zod";
-import { exec } from "child_process";
-import { promisify } from "util";
+import { spawn } from "child_process";
 import { CHARACTER_LIMIT } from "../constants.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { authorizeAction, PolicyDecision } from "../laya_client.js";
 
-const execAsync = promisify(exec);
+function runProcessGroup(command: string, cwd: string, timeoutMs = 60000, maxBuffer = 10 * 1024 * 1024): Promise<{ stdout: string; stderr: string }> {
+    return new Promise((resolve, reject) => {
+        const proc = spawn("/bin/sh", ["-c", command], {
+            cwd,
+            detached: true,
+            stdio: ["pipe", "pipe", "pipe"]
+        });
+
+        let stdout = "";
+        let stderr = "";
+        let timedOut = false;
+
+        const timer = setTimeout(() => {
+            timedOut = true;
+            try {
+                if (proc.pid) {
+                    process.kill(-proc.pid, "SIGKILL");
+                }
+            } catch {
+                proc.kill("SIGKILL");
+            }
+            reject(new Error(`Command timed out after ${timeoutMs}ms`));
+        }, timeoutMs);
+
+        proc.stdout.on("data", (d) => {
+            if (stdout.length < maxBuffer) stdout += d.toString();
+        });
+
+        proc.stderr.on("data", (d) => {
+            if (stderr.length < maxBuffer) stderr += d.toString();
+        });
+
+        proc.on("error", (err) => {
+            clearTimeout(timer);
+            reject(err);
+        });
+
+        proc.on("close", (code) => {
+            clearTimeout(timer);
+            if (!timedOut) {
+                if (code !== 0 && !stdout && stderr) {
+                    reject(new Error(`Command exited with code ${code}: ${stderr}`));
+                } else {
+                    resolve({ stdout, stderr });
+                }
+            }
+        });
+    });
+}
 
 export function registerCommandTools(server: McpServer) {
     server.registerTool(
@@ -45,11 +92,7 @@ export function registerCommandTools(server: McpServer) {
 
             try {
                 const allowedDir = process.env.ALLOWED_DIR || process.cwd();
-                const { stdout, stderr } = await execAsync(command, {
-                    cwd: allowedDir,
-                    timeout: 60000, // 60s command execution timeout
-                    maxBuffer: 10 * 1024 * 1024 // 10MB buffer cap
-                });
+                const { stdout, stderr } = await runProcessGroup(command, allowedDir);
                 
                 let output = "";
                 if (stdout) output += `STDOUT:\n${stdout}\n`;

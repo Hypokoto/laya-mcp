@@ -130,11 +130,13 @@ class DecisionResponse(BaseModel):
     probability: Optional[float] = None
     probabilities: Optional[Dict[str, float]] = None
 
-# Dangerous action patterns for policy guardrails (normalized regex)
-DESTRUCTIVE_REGEXES = [
-    re.compile(r"rm\s+(-[a-zA-Z]*[rf][a-zA-Z]*\s+)+(/|/\*|~|\$HOME|\*)", re.I),
-    re.compile(r"rm\s+-[a-zA-Z]*r[a-zA-Z]*f*\s+(/|/\*|~|\$HOME|\*)", re.I),
-    re.compile(r"rm\s+-[a-zA-Z]*f[a-zA-Z]*r*\s+(/|/\*|~|\$HOME|\*)", re.I),
+# Self-protection targets: guard engine files and harness configs against AI self-modification
+PROTECTED_PATHS_RE = re.compile(
+    r"(hooks/laya-pretool-hook\.js|laya_runtime/|laya_config\.json|\.claude/settings\.json|\.gemini/)",
+    re.I
+)
+
+OTHER_DESTRUCTIVE_REGEXES = [
     re.compile(r"find\s+.*\s+-delete\b", re.I),
     re.compile(r"\b(mkfs|fdisk|parted)\b", re.I),
     re.compile(r"dd\s+if=/dev/(zero|urandom)\s+of=", re.I),
@@ -144,28 +146,83 @@ DESTRUCTIVE_REGEXES = [
 ]
 
 AUTHORIZATION_REGEXES = [
-    re.compile(r"\|\s*(bash|sh|zsh)\b", re.I),
-    re.compile(r"bash\s+<\s*\(", re.I),
-    re.compile(r"(curl|wget)\s+.*(\||;|\&\&)\s*(sh|bash|python|perl)", re.I),
-    re.compile(r"curl\s+-[a-zA-Z]*o\s+\S+;\s*(sh|bash)", re.I)
+    re.compile(r"(curl|wget)\b.*\|\s*(sudo\s+)?(/bin/|/usr/bin/)?(bash|sh|zsh|python|perl)\b", re.I),
+    re.compile(r"(bash|sh|zsh)\s+-c\s+[\"'].*\b(curl|wget)\b", re.I),
+    re.compile(r"(bash|sh|zsh)\s+<\s*\(\s*(curl|wget)\b", re.I),
+    re.compile(r"(curl|wget)\s+.*-o\s+\S+\s*(&&|;)\s*(sudo\s+)?(/bin/|/usr/bin/)?(bash|sh|python)", re.I),
+    re.compile(r"git\s+push\s+.*(-f\b|--force\b)", re.I),
+    re.compile(r"git\s+reset\s+--hard\b", re.I),
+    re.compile(r"git\s+clean\s+-[a-zA-Z]*f[a-zA-Z]*d", re.I)
 ]
 
 SHELL_TOOL_RE = re.compile(r"^(run_command|Bash|terminal|shell|execute_command)$", re.I)
 
+def normalize_shell_command(cmd: str) -> str:
+    # 1. Expand IFS shell substitutions commonly used to evade whitespace regex
+    cmd = re.sub(r"\$\{?IFS\}?", " ", cmd)
+    # 2. Collapse whitespace
+    cmd = " ".join(cmd.split())
+    return cmd
+
+def is_destructive_rm(cmd: str) -> bool:
+    norm = normalize_shell_command(cmd)
+    rm_match = re.search(r"\b(sudo\s+)?(/bin/|/usr/bin/)?rm\b", norm, re.I)
+    if not rm_match:
+        return False
+
+    after_rm = norm[rm_match.end():].strip()
+    tokens = [t.strip("\"'") for t in after_rm.split() if t.strip()]
+
+    has_recursive = False
+    has_force = False
+    targets = []
+
+    for t in tokens:
+        if t.startswith("-"):
+            if t == "--recursive" or re.search(r"^-[a-zA-Z]*r", t, re.I):
+                has_recursive = True
+            if t == "--force" or re.search(r"^-[a-zA-Z]*f", t, re.I):
+                has_force = True
+            if t in ("-rf", "-fr", "-rfi", "-fir"):
+                has_recursive = True
+                has_force = True
+            if t == "--no-preserve-root":
+                has_force = True
+        else:
+            targets.append(t)
+
+    if has_recursive and (has_force or "--no-preserve-root" in norm):
+        destructive_targets = {"/", "/*", "~", "~/*", "$HOME", "${HOME}", ".", "./*", "*"}
+        for tgt in targets:
+            clean_tgt = tgt.rstrip("/") if tgt != "/" else "/"
+            if tgt in destructive_targets or clean_tgt in ("/", "~", "$HOME", "${HOME}", "."):
+                return True
+    return False
+
 def check_policy_patterns(tool: str, args: Dict[str, Any]) -> Optional[str]:
-    # Extract command string if available
+    # Extract command or filepath string
     cmd_str = args.get("CommandLine") or args.get("command") or args.get("cmd") or ""
+    filepath = args.get("filepath") or args.get("path") or args.get("file_path") or args.get("TargetFile") or ""
+    
+    # 1. Self-protection check: intercept any tool targeting policy engine files or harness hooks
+    combined_target = f"{cmd_str} {filepath}"
+    if PROTECTED_PATHS_RE.search(combined_target):
+        # Allow read actions through pattern check, but flag mutating actions
+        if not re.search(r"^(read|view|search|grep)", tool, re.I):
+            return "REQUIRE_AUTHORIZATION"
+
     if not cmd_str and SHELL_TOOL_RE.match(tool):
         cmd_str = serialize_state(args)
 
-    # Only run shell command regexes on shell tools or explicit command parameters
     if cmd_str:
-        normalized_cmd = " ".join(cmd_str.split())
-        for rx in DESTRUCTIVE_REGEXES:
-            if rx.search(normalized_cmd):
+        norm_cmd = normalize_shell_command(cmd_str)
+        if is_destructive_rm(norm_cmd):
+            return "DENY"
+        for rx in OTHER_DESTRUCTIVE_REGEXES:
+            if rx.search(norm_cmd):
                 return "DENY"
         for rx in AUTHORIZATION_REGEXES:
-            if rx.search(normalized_cmd):
+            if rx.search(norm_cmd):
                 return "REQUIRE_AUTHORIZATION"
     return None
 
@@ -254,11 +311,20 @@ def decide(req: DecisionRequest):
     decision = option_keys[best_idx]
     best_prob = float(probs[best_idx])
     
-    # 5. Security Threshold Enforcement (tau = 0.50 default, configurable via LAYA_ALLOW_THRESHOLD)
-    TAU = float(os.getenv("LAYA_ALLOW_THRESHOLD", "0.50"))
-    if decision == "ALLOW" and best_prob < TAU and "REQUIRE_AUTHORIZATION" in option_keys:
-        decision = "REQUIRE_AUTHORIZATION"
-        reasoning = f"Calibrated ALLOW probability {best_prob*100:.1f}% is below security threshold ({TAU*100:.0f}%); escalated to human authorization."
+    # 5. Security Threshold Enforcement & Multi-Class Risk Bounds
+    TAU = float(os.getenv("LAYA_ALLOW_THRESHOLD", "0.60"))
+    deny_prob = prob_dict.get("DENY", 0.0)
+    req_prob = prob_dict.get("REQUIRE_AUTHORIZATION", 0.0)
+
+    if decision == "ALLOW" and "REQUIRE_AUTHORIZATION" in option_keys:
+        if best_prob < TAU or deny_prob > 0.25 or req_prob > 0.35:
+            decision = "REQUIRE_AUTHORIZATION"
+            reasoning = (
+                f"Calibrated ALLOW probability {best_prob*100:.1f}% is below security threshold ({TAU*100:.0f}%) "
+                f"or risk margins exceeded (DENY={deny_prob*100:.1f}%, REQ={req_prob*100:.1f}%); escalated to human authorization."
+            )
+        else:
+            reasoning = f"Calibrated decision: {decision} ({best_prob*100:.1f}% confidence, temp={T:.2f})."
     else:
         reasoning = f"Calibrated decision: {decision} ({best_prob*100:.1f}% confidence, temp={T:.2f})."
         

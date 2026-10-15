@@ -7,8 +7,8 @@ import { ResponseFormat } from "../types.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { authorizeAction, PolicyDecision } from "../laya_client.js";
 
-// Ensure all paths are strictly contained within ALLOWED_DIR, resolving symlinks
-function sanitizePath(requestedPath: string): string {
+// Ensure all paths are strictly contained within ALLOWED_DIR, resolving symlinks for existing and new files
+function sanitizePath(requestedPath: string, isWrite = false): string {
     if (!requestedPath || typeof requestedPath !== "string") {
         throw new Error("Invalid path parameter");
     }
@@ -21,12 +21,36 @@ function sanitizePath(requestedPath: string): string {
 
     // Resolve realpaths to prevent symlink directory escapes
     const realAllowed = fsSync.existsSync(allowedDir) ? fsSync.realpathSync(allowedDir) : allowedDir;
-    const realResolved = fsSync.existsSync(resolvedPath) ? fsSync.realpathSync(resolvedPath) : resolvedPath;
 
-    const relative = path.relative(realAllowed, realResolved);
-    if (relative.startsWith("..") || path.isAbsolute(relative)) {
+    // Check nearest existing ancestor to prevent symlink directory escape on new/non-existent files
+    let curr = resolvedPath;
+    while (!fsSync.existsSync(curr)) {
+        const parent = path.dirname(curr);
+        if (parent === curr) break;
+        curr = parent;
+    }
+    const realAncestor = fsSync.existsSync(curr) ? fsSync.realpathSync(curr) : curr;
+    const relAncestor = path.relative(realAllowed, realAncestor);
+    if (relAncestor.startsWith("..") || path.isAbsolute(relAncestor)) {
         throw new Error(`Access denied: Cannot access files outside the allowed directory (${allowedDir})`);
     }
+
+    if (fsSync.existsSync(resolvedPath)) {
+        const realResolved = fsSync.realpathSync(resolvedPath);
+        const relative = path.relative(realAllowed, realResolved);
+        if (relative.startsWith("..") || path.isAbsolute(relative)) {
+            throw new Error(`Access denied: Cannot access files outside the allowed directory (${allowedDir})`);
+        }
+    }
+
+    // Self-Protection check on mutating actions: protect policy engine files and configs
+    if (isWrite) {
+        const PROTECTED_TARGETS_RE = /(hooks\/laya-pretool-hook\.js|laya_runtime\/|laya_config\.json|\.claude\/settings\.json|\.gemini\/)/i;
+        if (PROTECTED_TARGETS_RE.test(cleanPath) || PROTECTED_TARGETS_RE.test(resolvedPath)) {
+            throw new Error(`Access denied: Modification of Laya policy engine or harness configuration files is restricted.`);
+        }
+    }
+
     return resolvedPath;
 }
 
@@ -48,11 +72,11 @@ export function registerFileTools(server: McpServer) {
         },
         async ({ filepath }) => {
             try {
-                const fullPath = sanitizePath(filepath);
+                const fullPath = sanitizePath(filepath, false);
                 const stat = await fs.stat(fullPath);
                 
-                // Do not load massive binary files (like 1.7GB model weights) into memory as utf-8
-                const MAX_READ_BYTES = CHARACTER_LIMIT * 4; // ~100KB
+                // Do not load massive binary files into memory; cap at CHARACTER_LIMIT (25,000 bytes)
+                const MAX_READ_BYTES = CHARACTER_LIMIT;
                 const bytesToRead = Math.min(stat.size, MAX_READ_BYTES);
                 
                 const fh = await fs.open(fullPath, "r");
@@ -117,7 +141,7 @@ export function registerFileTools(server: McpServer) {
             }
 
             try {
-                const fullPath = sanitizePath(filepath);
+                const fullPath = sanitizePath(filepath, true);
                 await fs.mkdir(path.dirname(fullPath), { recursive: true });
                 await fs.writeFile(fullPath, content, "utf-8");
                 return {

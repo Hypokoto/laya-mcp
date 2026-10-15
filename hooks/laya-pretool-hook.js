@@ -15,7 +15,28 @@ const path = require('path');
 const fs = require('fs');
 
 // Strictly whitelisted read-only tools that bypass policy check immediately
-const READONLY_EXACT_RE = /^(view_file|read_file|grep|search_files|search_web|read_url_content|list_dir|glob)$/i;
+const READONLY_EXACT_RE = /^(view_file|read_file|read|grep|search_files|search_web|read_url_content|list_dir|listdir|ls|glob)$/i;
+
+// Self-protection regex for policy engine and harness configurations
+const PROTECTED_TARGETS_RE = /(hooks\/laya-pretool-hook\.js|laya_runtime\/|laya_config\.json|\.claude\/settings\.json|\.gemini\/)/i;
+
+/**
+ * Sanitizes and truncates tool arguments for policy evaluation.
+ * Large file contents (e.g. 50KB in Write/Edit) are summarized with metadata
+ * so they don't exceed the model's 512-token context and trigger accidental truncation escalation.
+ */
+function sanitizeArgsForPolicy(toolName, args) {
+    if (!args || typeof args !== 'object') return args;
+    const clean = { ...args };
+    const contentKeys = ['content', 'CodeContent', 'ReplacementContent', 'TargetContent', 'text'];
+    for (const key of contentKeys) {
+        if (typeof clean[key] === 'string' && clean[key].length > 250) {
+            clean[`${key}_length`] = clean[key].length;
+            clean[key] = clean[key].slice(0, 150) + '... [TRUNCATED_FOR_POLICY_REVIEW]';
+        }
+    }
+    return clean;
+}
 
 /**
  * Resolves the path to the laya-mcp server entry point.
@@ -210,27 +231,70 @@ function main() {
                 process.exit(0);
             }
 
-            // 2. All other tools (mutating, unknown, shell, MCP-namespaced):
-            // Evaluate strictly with Laya ONNX Engine
-            const { decision, reasoning } = await queryLayaDecide(toolName, toolArgs);
+            // 2. Self-Protection: Modifying policy files or harness configs requires human confirmation
+            const targetStr = JSON.stringify(toolArgs);
+            if (PROTECTED_TARGETS_RE.test(targetStr)) {
+                const selfProtectMsg = "Action REQUIRES HUMAN AUTHORIZATION: Modification of Laya policy engine or harness configuration files requires explicit confirmation.";
+                console.error(selfProtectMsg);
+                const selfProtectPayload = {
+                    hookSpecificOutput: {
+                        hookEventName: "PreToolUse",
+                        permissionDecision: "ask",
+                        permissionDecisionReason: selfProtectMsg
+                    },
+                    decision: "REQUIRE_AUTHORIZATION",
+                    reason: selfProtectMsg
+                };
+                process.stdout.write(JSON.stringify(selfProtectPayload) + '\n');
+                if (process.env.LAYA_HOOK_BLOCK_ON_AUTH === "true") {
+                    process.exit(2);
+                }
+                process.exit(0);
+            }
+
+            // 3. Sanitize large payloads (e.g. Write/Edit content) so they don't exceed 512 tokens
+            const sanitizedArgs = sanitizeArgsForPolicy(toolName, toolArgs);
+
+            // 4. Evaluate with Laya ONNX Engine
+            const { decision, reasoning } = await queryLayaDecide(toolName, sanitizedArgs);
 
             if (decision === 'ALLOW') {
                 process.exit(0);
             }
 
-            const blockMessage = decision === 'DENY'
-                ? `Action DENIED by Laya Policy Engine: ${reasoning}`
-                : `Action REQUIRES HUMAN AUTHORIZATION by Laya Policy Engine: ${reasoning}\nPlease ask the user for explicit confirmation before proceeding.`;
+            if (decision === 'REQUIRE_AUTHORIZATION') {
+                const askMsg = `Action REQUIRES HUMAN AUTHORIZATION by Laya Policy Engine: ${reasoning}`;
+                console.error(askMsg);
+                const askPayload = {
+                    hookSpecificOutput: {
+                        hookEventName: "PreToolUse",
+                        permissionDecision: "ask",
+                        permissionDecisionReason: askMsg
+                    },
+                    decision: "REQUIRE_AUTHORIZATION",
+                    reason: askMsg
+                };
+                process.stdout.write(JSON.stringify(askPayload) + '\n');
+                if (process.env.LAYA_HOOK_BLOCK_ON_AUTH === "true") {
+                    process.exit(2);
+                }
+                process.exit(0);
+            }
 
-            console.error(blockMessage);
-
-            const blockPayload = {
+            // DENY: Hard block
+            const denyMsg = `Action DENIED by Laya Policy Engine: ${reasoning}`;
+            console.error(denyMsg);
+            const denyPayload = {
+                hookSpecificOutput: {
+                    hookEventName: "PreToolUse",
+                    permissionDecision: "deny",
+                    permissionDecisionReason: denyMsg
+                },
                 block: true,
-                decision,
-                reason: blockMessage
+                decision: "DENY",
+                reason: denyMsg
             };
-
-            process.stdout.write(JSON.stringify(blockPayload) + '\n');
+            process.stdout.write(JSON.stringify(denyPayload) + '\n');
             process.exit(2);
         } catch (err) {
             console.error(`Laya PreToolUse Hook Error: ${err.message}`);

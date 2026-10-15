@@ -1,0 +1,17 @@
+# Prevent copying host build artifacts, caches, and weights into container build context
+node_modules/
+laya-mcp/node_modules/
+laya-mcp/dist/
+.git/
+.venv/
+__pycache__/
+*.pyc
+laya.onnx
+laya.onnx.data
+tokenizer/
+.cache/
+.npm_cache/
+.ralph/
+.security_audit/
+.uv_cache/
+*.log

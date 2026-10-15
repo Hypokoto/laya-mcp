@@ -83,19 +83,22 @@ This automatically registers Laya in detected installations of:
 
 ### Alternative: Local Network Access (SSE)
 
-To expose the system to multiple AI harnesses on your local Wi-Fi without configuring complex commands:
+To expose the system with Bearer token authentication and DNS rebinding protection:
 
 ```bash
 ./start_local.sh
 ```
-Connect your harness to:
+Connect your harness using:
 - **Transport:** SSE
-- **URL:** `http://<your-machine-ip>:3000/sse`
+- **URL:** `http://127.0.0.1:3000/sse`
+- **Header:** `Authorization: Bearer <LAYA_API_TOKEN>`
 
-### Alternative: Internet Access (Localtunnel)
+### Alternative: Rootless Sandboxed Execution (Podman / Docker)
+
+To run the MCP server with dropped capabilities, no new privileges, and isolated workspace mounts:
 
 ```bash
-./start_remote.sh
+./run_sandboxed.sh /path/to/your/workspace
 ```
 
 ---
@@ -106,15 +109,20 @@ Want Laya to actively guard your AI agents *before* any command executes, withou
 
 Laya includes a universal **PreToolUse decision hook** (`hooks/laya-pretool-hook.js`) compatible with Antigravity, Cursor, and Claude Code:
 
-- **0ms Fast-Path:** Non-mutating tools (`view_file`, `grep`, `search_web`, `read_url_content`, etc.) pass through immediately with zero overhead.
-- **Pre-Execution Guardrails:** Mutating commands (`run_command`, `Bash`, `write_to_file`, `replace_file_content`, `Edit`) are intercepted before execution and evaluated against the Laya ONNX decision model.
-- **Hard Block Policy:** Destructive commands (e.g. `rm -rf /`, out-of-boundary file writes) exit with code `2`, relaying structured denial reasons directly to the agent while preventing command execution dead in its tracks.
+- **0ms Fast-Path:** Non-mutating tools (`view_file`, `Read`, `read_file`, `Grep`, `Glob`, `LS`, `search_web`, `read_url_content`, etc.) pass through immediately with zero overhead.
+- **Pre-Execution Guardrails:** Mutating commands (`run_command`, `Bash`, `write_to_file`, `replace_file_content`, `Edit`) are intercepted before execution and evaluated against the calibrated Laya ONNX decision model.
+- **Interactive Escalation:** Actions requiring human confirmation return native `permissionDecision: "ask"` for Claude Code, prompting you interactively in the terminal rather than blocking indefinitely.
+- **Hard Block Policy:** Destructive commands (e.g. `rm -rf /`, `rm -rf ./*`, `git push --force`) exit with code `2` or return `permissionDecision: "deny"`, halting execution dead in its tracks.
+- **Emergency Escape Hatch:** If the local runtime is offline and you need to bypass interception immediately:
+  ```bash
+  cd laya-mcp && npm run hook:uninstall
+  ```
 
 ### Install or Uninstall Hook
 ```bash
 cd laya-mcp
-npm run hook:install     # Registers hook in Antigravity and Cursor
-npm run hook:uninstall   # Safely unregisters hook
+npm run hook:install     # Registers hook in Claude Code, Cursor, and Antigravity
+npm run hook:uninstall   # Safely unregisters hook (with .bak backups preserved)
 npm run test:hook        # Runs automated hook test suite
 ```
 

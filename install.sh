@@ -112,8 +112,14 @@ npm run build
 cd "$ROOT_DIR"
 echo -e "  ${GREEN}✓${NC} TypeScript build complete."
 
-# --- Step 5: Harness Registration & Skills Deployment ---
-echo -e "\n${BOLD}[5/6] Registering AI Harnesses and Skills...${NC}"
+# --- Step 5: Automated Smoke Test ---
+echo -e "\n${BOLD}[5/6] Running automated verification smoke test...${NC}"
+cd laya-mcp
+npm test
+cd "$ROOT_DIR"
+
+# --- Step 6: Harness Registration & Skills Deployment ---
+echo -e "\n${BOLD}[6/6] Registering AI Harnesses and Skills...${NC}"
 
 # Run harness setup wizard
 node laya-mcp/dist/index.js setup
@@ -143,12 +149,6 @@ deploy_skills() {
 
 deploy_skills "$GEMINI_SKILLS_DIR" "Antigravity/Gemini"
 deploy_skills "$CLAUDE_SKILLS_DIR" "Claude Code"
-
-# --- Step 6: Automated Smoke Test ---
-echo -e "\n${BOLD}[6/6] Running automated verification smoke test...${NC}"
-cd laya-mcp
-npm test
-cd "$ROOT_DIR"
 
 echo -e "\n${BOLD}${GREEN}"
 echo "================================================================================"

@@ -22,7 +22,24 @@ export interface HookInstallResult {
     message: string;
 }
 
-const homedir = os.homedir();
+export function getHomeDir(): string {
+    return process.env.HOME || os.homedir();
+}
+
+function safeBackupAndAtomicWrite(targetPath: string, data: any) {
+    const serialized = JSON.stringify(data, null, 2);
+    if (fs.existsSync(targetPath)) {
+        const origContent = fs.readFileSync(targetPath, "utf-8");
+        const origBak = `${targetPath}.orig.bak`;
+        if (!fs.existsSync(origBak)) {
+            fs.writeFileSync(origBak, origContent, "utf-8");
+        }
+        fs.writeFileSync(`${targetPath}.bak`, origContent, "utf-8");
+    }
+    const tmpFile = `${targetPath}.tmp.${Date.now()}.${Math.random().toString(36).slice(2)}`;
+    fs.writeFileSync(tmpFile, serialized, "utf-8");
+    fs.renameSync(tmpFile, targetPath);
+}
 
 /**
  * Resolves the absolute path to the hook script.
@@ -38,6 +55,7 @@ export function getHookScriptPath(): string {
 export async function installLayaHook(): Promise<HookInstallResult[]> {
     const results: HookInstallResult[] = [];
     const hookScript = getHookScriptPath();
+    const homedir = getHomeDir();
 
     if (!fs.existsSync(hookScript)) {
         throw new Error(`Hook script not found at ${hookScript}`);
@@ -85,7 +103,7 @@ export async function installLayaHook(): Promise<HookInstallResult[]> {
                     };
 
                     settings.hooks.BeforeTool.unshift(hookEntry);
-                    fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2), "utf-8");
+                    safeBackupAndAtomicWrite(settingsPath, settings);
 
                     results.push({
                         harness: "Antigravity",
@@ -135,7 +153,7 @@ export async function installLayaHook(): Promise<HookInstallResult[]> {
                     hooksJson.hooks.beforeToolUse.push({
                         command: `node "${hookScript}"`
                     });
-                    fs.writeFileSync(cursorPath, JSON.stringify(hooksJson, null, 2), "utf-8");
+                    safeBackupAndAtomicWrite(cursorPath, hooksJson);
                     results.push({
                         harness: "Cursor",
                         path: cursorPath,
@@ -188,7 +206,7 @@ export async function installLayaHook(): Promise<HookInstallResult[]> {
                         }
                     ]
                 });
-                fs.writeFileSync(claudeSettingsPath, JSON.stringify(claudeSettings, null, 2), "utf-8");
+                safeBackupAndAtomicWrite(claudeSettingsPath, claudeSettings);
                 results.push({
                     harness: "Claude Code",
                     path: claudeSettingsPath,
@@ -214,6 +232,7 @@ export async function installLayaHook(): Promise<HookInstallResult[]> {
  */
 export async function uninstallLayaHook(): Promise<HookInstallResult[]> {
     const results: HookInstallResult[] = [];
+    const homedir = getHomeDir();
 
     // 1. Antigravity settings
     const antigravitySettingsPaths = [
@@ -232,7 +251,7 @@ export async function uninstallLayaHook(): Promise<HookInstallResult[]> {
                     );
 
                     if (settings.hooks.BeforeTool.length < initialLen) {
-                        fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2), "utf-8");
+                        safeBackupAndAtomicWrite(settingsPath, settings);
                         results.push({
                             harness: "Antigravity",
                             path: settingsPath,
@@ -277,7 +296,7 @@ export async function uninstallLayaHook(): Promise<HookInstallResult[]> {
                     );
 
                     if (hooksJson.hooks.beforeToolUse.length < initialLen) {
-                        fs.writeFileSync(cursorPath, JSON.stringify(hooksJson, null, 2), "utf-8");
+                        safeBackupAndAtomicWrite(cursorPath, hooksJson);
                         results.push({
                             harness: "Cursor",
                             path: cursorPath,
@@ -310,7 +329,7 @@ export async function uninstallLayaHook(): Promise<HookInstallResult[]> {
                 );
 
                 if (claudeSettings.hooks.PreToolUse.length < initialLen) {
-                    fs.writeFileSync(claudeSettingsPath, JSON.stringify(claudeSettings, null, 2), "utf-8");
+                    safeBackupAndAtomicWrite(claudeSettingsPath, claudeSettings);
                     results.push({
                         harness: "Claude Code",
                         path: claudeSettingsPath,

@@ -134,7 +134,11 @@ export async function setupAllHarnesses(targetDir?: string): Promise<SetupResult
                         const content = fs.readFileSync(configPath, "utf-8");
                         try {
                             currentJson = JSON.parse(content);
-                            // Create safety backup before mutating
+                            // Create safety backups: retain original pristine backup (.orig.bak) and latest (.bak)
+                            const origBak = `${configPath}.orig.bak`;
+                            if (!fs.existsSync(origBak)) {
+                                fs.writeFileSync(origBak, content, "utf-8");
+                            }
                             fs.writeFileSync(`${configPath}.bak`, content, "utf-8");
                         } catch (parseErr: any) {
                             throw new Error(`Failed to parse existing config JSON at ${configPath}: ${parseErr.message}. Aborting to prevent file clobbering.`);
@@ -169,7 +173,9 @@ export async function setupAllHarnesses(targetDir?: string): Promise<SetupResult
                         };
                     }
 
-                    fs.writeFileSync(configPath, JSON.stringify(currentJson, null, 2), "utf-8");
+                    const tmpFile = `${configPath}.tmp.${Date.now()}.${Math.random().toString(36).slice(2)}`;
+                    fs.writeFileSync(tmpFile, JSON.stringify(currentJson, null, 2), "utf-8");
+                    fs.renameSync(tmpFile, configPath);
 
                     results.push({
                         harness: harness.name,

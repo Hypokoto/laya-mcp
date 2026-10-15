@@ -175,3 +175,68 @@ For browser-based harnesses, web agents (e.g. LibreChat, LangChain, custom agent
    - **Type**: `sse`
    - **URL**: `http://localhost:3000/sse`
    - **Health Check**: `http://localhost:3000/health`
+
+---
+
+## 🛡 Hardcoded Decision Interceptor (PreToolUse Hook)
+
+For deep harness integration where you want to **hardcode** the Laya Decision Engine to intercept and govern every tool call *before* execution:
+
+### Automated Hook Setup
+```bash
+cd laya-mcp
+npm run hook:install
+```
+
+To remove the hook at any time:
+```bash
+cd laya-mcp
+npm run hook:uninstall
+```
+
+### How It Works
+
+1. **Deterministic Fast-Path (0ms):**
+   Read-only tools (`view_file`, `read_file`, `grep`, `search_files`, `search_web`, `read_url_content`, `list_dir`) bypass evaluation immediately with 0ms latency.
+2. **Mutating Action Interception:**
+   Mutating actions (`run_command`, `Bash`, `write_to_file`, `replace_file_content`, `Edit`) trigger an instantaneous JSON-RPC query to `laya-mcp`'s `laya_decide` tool.
+3. **Policy Enforcement:**
+   - **`ALLOW`**: Hook exits with code `0`, allowing the harness to run the tool.
+   - **`DENY`**: Hook exits with code `2` and writes the denial rationale to `stderr` and JSON output to `stdout`. The harness aborts execution and provides the reason directly to the model.
+   - **`REQUIRE_AUTHORIZATION`**: Hook exits with code `2`, requesting human confirmation before dangerous operations proceed.
+
+### Harness Configurations Updated
+
+- **Antigravity IDE & CLI (`~/.gemini/antigravity-ide/settings.json`)**:
+  ```json
+  {
+    "hooks": {
+      "BeforeTool": [
+        {
+          "matcher": "Bash|Edit|Write|MultiEdit|run_command|write_to_file|replace_file_content",
+          "hooks": [
+            {
+              "type": "command",
+              "command": "node \"/path/to/laya-onnx/hooks/laya-pretool-hook.js\"",
+              "timeout": 15
+            }
+          ]
+        }
+      ]
+    }
+  }
+  ```
+
+- **Cursor IDE (`~/.cursor/hooks.json`)**:
+  ```json
+  {
+    "version": 1,
+    "hooks": {
+      "beforeToolUse": [
+        {
+          "command": "node \"/path/to/laya-onnx/hooks/laya-pretool-hook.js\""
+        }
+      ]
+    }
+  }
+  ```

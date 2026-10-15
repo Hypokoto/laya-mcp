@@ -13,9 +13,12 @@
     "setup": "node dist/index.js setup",
     "dev": "tsx watch src/index.ts",
     "build": "tsc",
-    "test": "tsx tests/handshake_test.ts && tsx tests/evaluation_test.ts",
+    "hook:install": "node dist/index.js hook:install",
+    "hook:uninstall": "node dist/index.js hook:uninstall",
+    "test": "tsx tests/handshake_test.ts && tsx tests/evaluation_test.ts && tsx tests/hook_test.ts",
     "test:handshake": "tsx tests/handshake_test.ts",
-    "test:eval": "tsx tests/evaluation_test.ts"
+    "test:eval": "tsx tests/evaluation_test.ts",
+    "test:hook": "tsx tests/hook_test.ts"
   },
   "engines": {
     "node": ">=18"

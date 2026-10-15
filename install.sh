@@ -118,6 +118,10 @@ echo -e "\n${BOLD}[5/6] Registering AI Harnesses and Skills...${NC}"
 # Run harness setup wizard
 node laya-mcp/dist/index.js setup
 
+# Register hardcoded PreToolUse decision interceptor hook
+echo -e "  ${BLUE}Registering PreToolUse decision interceptor hook...${NC}"
+node laya-mcp/dist/index.js hook:install
+
 # Prompt for skills symlinks if skill directories exist
 CLAUDE_SKILLS_DIR="$HOME/.claude/skills"
 GEMINI_SKILLS_DIR="$HOME/.gemini/config/skills"

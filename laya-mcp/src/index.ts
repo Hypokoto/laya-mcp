@@ -24,6 +24,7 @@ import { registerMetadataTools } from "./tools/metadata.js";
 import { registerDecideTools } from "./tools/decide.js";
 import { isRuntimeHealthy } from "./laya_client.js";
 import { setupAllHarnesses } from "./setup.js";
+import { installLayaHook, uninstallLayaHook } from "./hook_installer.js";
 
 import { spawn } from "child_process";
 import { fileURLToPath } from "url";
@@ -149,6 +150,37 @@ async function main() {
         process.exit(0);
     }
 
+    // Subcommand: hook:install
+    if (args.includes("hook:install") || args.includes("--hook-install")) {
+        console.error("🔒 Installing hardcoded Laya PreToolUse hook into AI harnesses...");
+        const results = await installLayaHook();
+        console.log("\n=================================================");
+        console.log("       Laya PreToolUse Hook Installation");
+        console.log("=================================================");
+        for (const res of results) {
+            const icon = res.status === "installed" || res.status === "already_installed" ? "✅" : res.status === "skipped" ? "⚪" : "❌";
+            console.log(`${icon} ${res.harness}: ${res.message}`);
+            console.log(`   Settings: ${res.path}`);
+        }
+        console.log("=================================================\n");
+        process.exit(0);
+    }
+
+    // Subcommand: hook:uninstall
+    if (args.includes("hook:uninstall") || args.includes("--hook-uninstall")) {
+        console.error("🔓 Uninstalling Laya PreToolUse hook from AI harnesses...");
+        const results = await uninstallLayaHook();
+        console.log("\n=================================================");
+        console.log("       Laya PreToolUse Hook Removal");
+        console.log("=================================================");
+        for (const res of results) {
+            const icon = res.status === "uninstalled" ? "✅" : "⚪";
+            console.log(`${icon} ${res.harness}: ${res.message}`);
+        }
+        console.log("=================================================\n");
+        process.exit(0);
+    }
+
     if (args.includes("--help") || args.includes("-h")) {
         console.log(`
 Laya MCP Server — Universal AI Decision & Policy Engine
@@ -156,11 +188,15 @@ Laya MCP Server — Universal AI Decision & Policy Engine
 Usage:
   npx laya-mcp                Start in standard stdio mode (for Claude Desktop, Cursor, etc.)
   npx laya-mcp setup          Auto-configure Laya in all installed AI harnesses
+  npx laya-mcp hook:install   Install hardcoded PreToolUse decision hook into Antigravity/Cursor
+  npx laya-mcp hook:uninstall Remove PreToolUse decision hook
   npx laya-mcp --http [port]  Start HTTP/SSE server (default port: 3000)
 
 Options:
   --http, -p [port]     Run HTTP/SSE server on specified port (or PORT env var)
   --setup               Scan and configure installed AI harnesses
+  --hook-install        Install PreToolUse decision hook in AI harnesses
+  --hook-uninstall      Uninstall PreToolUse decision hook
   --help, -h            Show this help message
 
 Environment Variables:

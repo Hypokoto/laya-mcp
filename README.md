@@ -100,7 +100,27 @@ Connect your harness to:
 
 ---
 
-## 4. Skills
+## 4. Hardcoded Harness Interceptor (PreToolUse Hook)
+
+Want Laya to actively guard your AI agents *before* any command executes, without relying on the model remembering to call an MCP tool?
+
+Laya includes a universal **PreToolUse decision hook** (`hooks/laya-pretool-hook.js`) compatible with Antigravity, Cursor, and Claude Code:
+
+- **0ms Fast-Path:** Non-mutating tools (`view_file`, `grep`, `search_web`, `read_url_content`, etc.) pass through immediately with zero overhead.
+- **Pre-Execution Guardrails:** Mutating commands (`run_command`, `Bash`, `write_to_file`, `replace_file_content`, `Edit`) are intercepted before execution and evaluated against the Laya ONNX decision model.
+- **Hard Block Policy:** Destructive commands (e.g. `rm -rf /`, out-of-boundary file writes) exit with code `2`, relaying structured denial reasons directly to the agent while preventing command execution dead in its tracks.
+
+### Install or Uninstall Hook
+```bash
+cd laya-mcp
+npm run hook:install     # Registers hook in Antigravity and Cursor
+npm run hook:uninstall   # Safely unregisters hook
+npm run test:hook        # Runs automated hook test suite
+```
+
+---
+
+## 5. Skills
 
 This repository includes three pre-audited Markdown skills (`skills/`) that teach your AI how to use this MCP server:
 - `skills/laya-decision-model`: How to formulate active decisions (`laya_decide`).
@@ -116,9 +136,9 @@ ln -sfn $(pwd)/skills/laya-code-analysis ~/.gemini/config/skills/laya-code-analy
 
 ---
 
-## 5. Automated Verification
+## 6. Automated Verification
 
-Run the full handshake and 10-question evaluation test suite:
+Run the full handshake, 10-question evaluation, and hook test suites:
 
 ```bash
 cd laya-mcp

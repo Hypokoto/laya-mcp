@@ -82,6 +82,9 @@ async function runHookTestSuite() {
             tool_name: "run_command",
             tool_input: { CommandLine: "git status" }
         });
+        if (res.code !== 0) {
+            console.error(`\n    [Diagnose Fail] Exit Code: ${res.code}, Duration: ${res.duration}ms\n    Stderr: ${res.stderr.trim()}\n    Stdout: ${res.stdout.trim()}`);
+        }
         return res.code === 0;
     });
 
@@ -92,6 +95,9 @@ async function runHookTestSuite() {
             tool_input: { CommandLine: "rm -rf /" }
         });
         const blockedOutput = res.stderr.includes("DENIED") || res.stdout.includes("DENY") || res.stdout.includes('"block":true');
+        if (res.code !== 2 || !blockedOutput) {
+            console.error(`\n    [Diagnose Fail] Exit Code: ${res.code}, Duration: ${res.duration}ms\n    Stderr: ${res.stderr.trim()}\n    Stdout: ${res.stdout.trim()}`);
+        }
         return res.code === 2 && blockedOutput;
     });
 

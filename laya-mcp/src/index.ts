@@ -91,7 +91,10 @@ async function triggerPythonWarmup(): Promise<void> {
             } catch {}
         };
 
-        process.on("exit", cleanup);
+        // Detached daemon persists across short-lived hook/tool invocations
+        if (process.env.LAYA_EPHEMERAL_RUNTIME === "1") {
+            process.on("exit", cleanup);
+        }
         process.on("SIGINT", () => { cleanup(); process.exit(0); });
         process.on("SIGTERM", () => { cleanup(); process.exit(0); });
 

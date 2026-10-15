@@ -49,10 +49,55 @@ function normalizePayload(raw) {
     return { toolName, toolArgs };
 }
 
+const RUNTIME_URL = process.env.LAYA_RUNTIME_URL || 'http://127.0.0.1:8000';
+
 /**
- * Queries laya-mcp over stdio via JSON-RPC.
+ * Fast-path HTTP query if Laya runtime daemon is already active (<150ms).
+ */
+async function queryDirectHttp(toolName, toolArgs) {
+    try {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 2000);
+        const res = await fetch(`${RUNTIME_URL}/decide`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                tool: toolName,
+                args: toolArgs,
+                context: `Is executing the tool '${toolName}' safe or dangerous according to project security policies?`,
+                criteria: {
+                    ALLOW: 'Safe action operating strictly within expected project files or benign commands.',
+                    DENY: 'Dangerous or destructive action (e.g. deleting root/system files or wildcard deletion).',
+                    REQUIRE_AUTHORIZATION: 'Sensitive action (installing untrusted dependencies, executing remote scripts) requiring user consent.'
+                }
+            }),
+            signal: controller.signal
+        });
+        clearTimeout(timeout);
+        if (res.ok) {
+            const data = await res.json();
+            return {
+                decision: data.decision || 'DENY',
+                reasoning: data.reasoning || 'Evaluated by local Laya ONNX engine'
+            };
+        }
+    } catch {
+        // Fallback to stdio MCP spawn
+    }
+    return null;
+}
+
+/**
+ * Queries laya-mcp over stdio via JSON-RPC (with automatic background engine warmup).
  */
 async function queryLayaDecide(toolName, toolArgs) {
+    // 1. Fast direct HTTP evaluation if runtime is active
+    const directRes = await queryDirectHttp(toolName, toolArgs);
+    if (directRes) {
+        return directRes;
+    }
+
+    // 2. Fallback to MCP stdio server with warmup
     const serverPath = resolveLayaMcpPath();
     const repoRoot = process.env.LAYA_HOME || path.resolve(__dirname, '..');
 
@@ -77,9 +122,9 @@ async function queryLayaDecide(toolName, toolArgs) {
             proc.kill();
             resolve({
                 decision: 'DENY',
-                reasoning: 'Laya policy check timed out after 10 seconds.'
+                reasoning: 'Laya policy check timed out after 25 seconds during cold start.'
             });
-        }, 10000);
+        }, 25000);
 
         const sendRpc = (id, method, params = {}) => {
             const msg = JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n';

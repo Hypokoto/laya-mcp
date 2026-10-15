@@ -249,6 +249,76 @@ async function runHookTestSuite() {
         }
     });
 
+    // 9. Session Authorization Caching & Repeat Prompt Fatigue Elimination
+    await check("Session Authorization Caching: sensitive action approved once passes seamlessly on repeat", async () => {
+        const testSessionId = `test_sess_${Date.now()}`;
+        const payload = {
+            tool_name: "run_command",
+            tool_input: { CommandLine: "git push origin staging --force" },
+            session_id: testSessionId
+        };
+
+        // First call: must require authorization (ask, exit 0)
+        const res1 = await runHookWithPayload(payload);
+        let parsed1: any = {};
+        try { parsed1 = JSON.parse(res1.stdout); } catch {}
+        const isAsk1 = res1.code === 0 &&
+            parsed1.hookSpecificOutput?.permissionDecision === "ask" &&
+            parsed1.decision === "REQUIRE_AUTHORIZATION";
+
+        if (!isAsk1) {
+            console.error(`\n    First invocation did not trigger authorization: code=${res1.code}, stdout=${res1.stdout}`);
+            return false;
+        }
+
+        // Second identical call with same session_id: pre-approved! Exits 0 directly without 'ask'
+        const res2 = await runHookWithPayload(payload);
+        let parsed2: any = {};
+        try { parsed2 = JSON.parse(res2.stdout); } catch {}
+        const isCachedPass = res2.code === 0 && parsed2.hookSpecificOutput?.permissionDecision !== "ask";
+
+        if (!isCachedPass) {
+            console.error(`\n    Second invocation failed session cache bypass: code=${res2.code}, stdout=${res2.stdout}`);
+            return false;
+        }
+
+        // Third call with DIFFERENT session_id: requires authorization again (session isolation)
+        const payloadOtherSession = { ...payload, session_id: `${testSessionId}_diff` };
+        const res3 = await runHookWithPayload(payloadOtherSession);
+        let parsed3: any = {};
+        try { parsed3 = JSON.parse(res3.stdout); } catch {}
+        const isAsk3 = res3.code === 0 &&
+            parsed3.hookSpecificOutput?.permissionDecision === "ask" &&
+            parsed3.decision === "REQUIRE_AUTHORIZATION";
+
+        if (!isAsk3) {
+            console.error(`\n    Isolated session did not require authorization: code=${res3.code}, stdout=${res3.stdout}`);
+            return false;
+        }
+
+        return true;
+    });
+
+    // 10. Destructive Command Invariant is Never Cached
+    await check("Destructive invariant commands (rm -rf /) are strictly DENIED and never cached", async () => {
+        const testSessionId = `test_sess_deny_${Date.now()}`;
+        const payload = {
+            tool_name: "run_command",
+            tool_input: { CommandLine: "rm -rf /" },
+            session_id: testSessionId
+        };
+
+        // Run 1: Must DENY (exit 2)
+        const res1 = await runHookWithPayload(payload);
+        if (res1.code !== 2) return false;
+
+        // Run 2: Must still DENY (exit 2)
+        const res2 = await runHookWithPayload(payload);
+        if (res2.code !== 2) return false;
+
+        return true;
+    });
+
     console.log(`\n========================================`);
     console.log(`Hook Test Summary: ${passed} Passed, ${failed} Failed`);
     console.log(`========================================`);

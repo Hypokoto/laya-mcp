@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Tuple
 from contextlib import asynccontextmanager
 import os
 import re
@@ -199,18 +199,54 @@ def is_destructive_rm(cmd: str) -> bool:
                 return True
     return False
 
-def check_policy_patterns(tool: str, args: Dict[str, Any]) -> Optional[str]:
-    # Extract command or filepath string
+def synthesize_dynamic_criteria(tool: str, args: Dict[str, Any]) -> Tuple[str, Dict[str, str]]:
+    is_shell = bool(SHELL_TOOL_RE.match(tool))
+    is_file_mut = bool(re.search(r"^(write|edit|replace|append|delete|remove|laya_write_file)", tool, re.I))
+
+    cmd_str = args.get("CommandLine") or args.get("command") or args.get("cmd") or ""
+    is_git = bool(re.search(r"\bgit\b", cmd_str, re.I))
+
+    if is_git:
+        context = "Evaluate the Git version control command. Is this operation standard project development or risky to repository history?"
+        criteria = {
+            "ALLOW": "Standard non-destructive git command: status, diff, log, commit, checkout branch, or local stash.",
+            "DENY": "Catastrophic or permanent git destruction: force-deleting repositories or wiping .git configuration.",
+            "REQUIRE_AUTHORIZATION": "Sensitive git operation: force pushing to remote branches (git push --force), hard resets (git reset --hard), or discarding uncommitted work."
+        }
+    elif is_shell:
+        context = "Evaluate the shell command. Is this safe developmental work or potentially harmful to system integrity?"
+        criteria = {
+            "ALLOW": "Safe, non-destructive developmental command: running builds, running tests, checking status, inspecting files, local compilation, or project cleanup.",
+            "DENY": "Catastrophic or malicious command: deleting root files (rm -rf /), formatting drives, raw disk writes, or executing fork bombs.",
+            "REQUIRE_AUTHORIZATION": "Sensitive command requiring user awareness: installing external dependencies, executing remote download scripts (curl | bash), modifying system network settings, or launching background daemons."
+        }
+    elif is_file_mut:
+        context = "Evaluate the file modification. Is this safe project work or does it violate security boundaries?"
+        criteria = {
+            "ALLOW": "Standard project file modification: editing source code, documentation, test files, or assets within the project workspace.",
+            "DENY": "Malicious or unauthorized file action: writing outside the project sandbox, path traversal, or modifying protected system files.",
+            "REQUIRE_AUTHORIZATION": "Sensitive configuration change: modifying package lockfiles, root configuration files (package.json, pyproject.toml), or CI/CD workflow scripts."
+        }
+    else:
+        context = f"The agent wants to run the tool '{tool}'. Is this action safe or potentially harmful?"
+        criteria = {
+            "ALLOW": "The action is safe, read-only, or modifies project files in an expected, non-destructive way.",
+            "DENY": "The action is highly destructive (e.g. deleting system files) or clearly malicious.",
+            "REQUIRE_AUTHORIZATION": "The action carries security risk or modifies sensitive configs and requires human approval."
+        }
+    return context, criteria
+
+def check_emergency_invariants(tool: str, args: Dict[str, Any]) -> Optional[str]:
     cmd_str = args.get("CommandLine") or args.get("command") or args.get("cmd") or ""
     filepath = args.get("filepath") or args.get("path") or args.get("file_path") or args.get("TargetFile") or ""
-    
+
     # 1. Self-protection check: intercept any tool targeting policy engine files or harness hooks
     combined_target = f"{cmd_str} {filepath}"
     if PROTECTED_PATHS_RE.search(combined_target):
-        # Allow read actions through pattern check, but flag mutating actions
         if not re.search(r"^(read|view|search|grep)", tool, re.I):
             return "REQUIRE_AUTHORIZATION"
 
+    # 2. Emergency invariant: Literal catastrophic destruction (e.g. rm -rf /)
     if not cmd_str and SHELL_TOOL_RE.match(tool):
         cmd_str = serialize_state(args)
 
@@ -229,33 +265,20 @@ def check_policy_patterns(tool: str, args: Dict[str, Any]) -> Optional[str]:
 # --- Decision Endpoint ---
 @app.post("/decide", response_model=DecisionResponse)
 def decide(req: DecisionRequest):
-    print(f"Authorizing/Evaluating: {req.tool} ...")
-    
-    ins = req.context if req.context else f"The agent wants to run the tool '{req.tool}'. Is this action safe or highly destructive?"
+    print(f"Authorizing/Evaluating with Laya Neural Brain: {req.tool} ...")
     state = req.args
-    
-    if req.criteria:
+
+    # 1. Synthesize Tool-Specific Dynamic Criteria if not explicitly provided
+    if req.criteria and req.context:
+        ins = req.context
         crit = req.criteria
     else:
-        crit = {
-            "ALLOW": "The action is safe, read-only, or modifies project files in an expected, non-destructive way.",
-            "DENY": "The action is highly destructive (e.g. rm -rf, deleting system files) or clearly malicious.",
-            "REQUIRE_AUTHORIZATION": "The action is risky but potentially valid (e.g. installing dependencies) and requires human approval."
-        }
-    
+        dynamic_ins, dynamic_crit = synthesize_dynamic_criteria(req.tool, state)
+        ins = req.context if req.context else dynamic_ins
+        crit = req.criteria if req.criteria else dynamic_crit
+
     option_keys = list(crit.keys())
-    
-    # 1. Deterministic Security Pattern Guardrails
-    verdict = check_policy_patterns(req.tool, state)
-    if verdict and verdict in option_keys:
-        reasoning = (
-            f"Action classified as {verdict} by Laya policy guardrails: matched sensitive pattern."
-            if verdict == "REQUIRE_AUTHORIZATION"
-            else f"Action DENIED by Laya policy guardrails: highly destructive command or action detected."
-        )
-        print(f"-> Guardrail Decision: {verdict}")
-        return DecisionResponse(decision=verdict, reasoning=reasoning, probability=1.0)
-    
+
     # 2. Build Sequence & Detect Truncation
     seq, markers, option_keys, truncated = build_sequence(
         state=state,
@@ -263,7 +286,7 @@ def decide(req: DecisionRequest):
         ins=ins,
         crit=crit
     )
-    
+
     # Truncation Guardrail: If input exceeds sequence window, escalate to prevent payload hiding
     if truncated and "REQUIRE_AUTHORIZATION" in option_keys:
         return DecisionResponse(
@@ -271,9 +294,9 @@ def decide(req: DecisionRequest):
             reasoning="Input payload exceeds 512 token context budget; truncated payloads require human authorization.",
             probability=1.0
         )
-    
+
     qtype_int = 0 # 0 for choice
-    
+
     inputs = {
         "input_ids": np.array([seq], dtype=np.int64),
         "attention_mask": np.ones((1, len(seq)), dtype=np.int64),
@@ -281,11 +304,11 @@ def decide(req: DecisionRequest):
         "marker_mask": np.ones((1, len(markers)), dtype=np.bool_),
         "qtype": np.array([qtype_int], dtype=np.int64)
     }
-    
-    # 3. Model Inference
+
+    # 3. Model Inference (Laya's Neural Brain Evaluates Action Upfront)
     outputs = session.run(["logits", "act_probs"], inputs)
     logits = outputs[0][0] # [K]
-    
+
     # 4. Temperature-Calibrated Softmax
     K = len(option_keys)
     temp_key = f"choice:{K}"
@@ -298,19 +321,19 @@ def decide(req: DecisionRequest):
             temp_key = "choice:11+"
         else:
             temp_key = "choice:2"
-            
+
     T = float(temperature_by_options.get(temp_key, 1.0))
     raw_logits = np.array(logits[:K], dtype=np.float64)
     scaled_logits = raw_logits / max(1e-4, T)
-    
+
     exp_logits = np.exp(scaled_logits - np.max(scaled_logits))
     probs = exp_logits / np.sum(exp_logits)
-    
+
     prob_dict = {k: float(probs[i]) for i, k in enumerate(option_keys)}
     best_idx = int(np.argmax(probs))
     decision = option_keys[best_idx]
     best_prob = float(probs[best_idx])
-    
+
     # 5. Security Threshold Enforcement & Multi-Class Risk Bounds
     TAU = float(os.getenv("LAYA_ALLOW_THRESHOLD", "0.60"))
     deny_prob = prob_dict.get("DENY", 0.0)
@@ -324,12 +347,23 @@ def decide(req: DecisionRequest):
                 f"or risk margins exceeded (DENY={deny_prob*100:.1f}%, REQ={req_prob*100:.1f}%); escalated to human authorization."
             )
         else:
-            reasoning = f"Calibrated decision: {decision} ({best_prob*100:.1f}% confidence, temp={T:.2f})."
+            reasoning = f"Evaluated by Laya neural brain: {decision} ({best_prob*100:.1f}% confidence, temp={T:.2f})."
     else:
-        reasoning = f"Calibrated decision: {decision} ({best_prob*100:.1f}% confidence, temp={T:.2f})."
-        
-    print(f"-> Decision: {decision} (prob={best_prob:.4f}, T={T:.2f})")
-    
+        reasoning = f"Evaluated by Laya neural brain: {decision} ({best_prob*100:.1f}% confidence, temp={T:.2f})."
+
+    # 6. Emergency Invariants Safety Net:
+    # Catastrophic destruction (e.g. rm -rf /) must ALWAYS DENY, overriding ALLOW and REQUIRE_AUTHORIZATION.
+    # Self-protection and sensitive patterns override ALLOW to REQUIRE_AUTHORIZATION.
+    emergency_verdict = check_emergency_invariants(req.tool, state)
+    if emergency_verdict == "DENY":
+        decision = "DENY"
+        reasoning = f"Emergency safety net overrule: caught catastrophic {emergency_verdict} invariant violation."
+    elif emergency_verdict == "REQUIRE_AUTHORIZATION" and decision == "ALLOW":
+        decision = "REQUIRE_AUTHORIZATION"
+        reasoning = f"Emergency safety net overrule: caught {emergency_verdict} invariant violation despite neural output."
+
+    print(f"-> Final Decision: {decision} (neural={option_keys[best_idx]}, prob={best_prob:.4f}, T={T:.2f})")
+
     return DecisionResponse(
         decision=decision,
         reasoning=reasoning,

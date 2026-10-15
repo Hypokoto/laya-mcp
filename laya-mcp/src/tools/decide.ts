@@ -11,8 +11,8 @@ export function registerDecideTools(server: McpServer) {
             inputSchema: z.object({
                 tool: z.string().describe("The context identifier or name of the action/data to evaluate (e.g. 'security_check', 'email_classification')"),
                 args: z.record(z.any()).describe("The structured JSON state or input data payload to evaluate"),
-                instruction: z.string().describe("The specific question, instruction, or prompt for the Laya decision model"),
-                criteria: z.record(z.string()).describe("A dictionary mapping option keys to their criteria descriptions (e.g. {'ALLOW': 'Safe operation', 'DENY': 'Destructive operation'})")
+                instruction: z.string().optional().describe("The specific question, instruction, or prompt for the Laya decision model (omitted for automatic dynamic criteria synthesis)"),
+                criteria: z.record(z.string()).optional().describe("A dictionary mapping option keys to their criteria descriptions (omitted for automatic dynamic criteria synthesis)")
             }).strict(),
             annotations: {
                 readOnlyHint: true,

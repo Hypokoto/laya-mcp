@@ -121,7 +121,7 @@ function queryCliFallback(requestObj) {
         input: payload,
         encoding: 'utf8',
         timeout: 15000,
-        cwd: requestObj.workspace || process.cwd(),
+        cwd: process.cwd(),
         env: { ...process.env },
     });
 

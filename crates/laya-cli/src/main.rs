@@ -544,7 +544,9 @@ async fn main() -> Result<()> {
             println!("================================================================================");
 
             let tcp_task = tokio::spawn(async move {
-                let _ = axum::serve(tcp_listener, app).await;
+                if let Err(e) = axum::serve(tcp_listener, app).await {
+                    eprintln!("[LAYA FATAL] TCP server failed: {}", e);
+                }
             });
 
             #[cfg(unix)]
@@ -750,11 +752,12 @@ async fn decide_handler(
 
                 // Security: verify policy content hash atomically against trust registry before loading.
                 if let Some((content, trusted_by_hash, policy_path)) = crate::policy_cmd::verify_and_read_project_policy(target_ws, &trust_file) {
-                    // Only grant is_trusted if the request workspace matches the server-controlled
-                    // workspace (if configured) AND its hash matches the trust registry.
+                    // Only grant is_trusted if the server has an authoritative workspace configured,
+                    // the request workspace matches it, AND the policy hash is trusted.
+                    // When server_ws is None, no trust is granted — the request workspace is untrusted input.
                     let is_trusted = match server_ws.as_ref() {
                         Some(sws) => sws == target_ws && trusted_by_hash,
-                        None => trusted_by_hash,
+                        None => false,
                     };
 
                     let is_toml = policy_path.extension().and_then(|s| s.to_str()) == Some("toml");

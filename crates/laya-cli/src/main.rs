@@ -739,13 +739,42 @@ async fn decide_handler(
     let engine = state.engine.clone();
     let server_ws = state.server_workspace.clone();
     tokio::task::spawn_blocking(move || {
-        // Evaluate the requesting project's policy; trust it only if it matches the server-controlled root (if configured).
+        // Security: when server_ws is configured, it is the authoritative containment root.
+        // A request workspace outside server_ws is rejected to prevent path containment bypass (e.g. workspace: "/").
         let req_ws = payload.workspace.as_ref()
             .map(|w| fs::canonicalize(w).unwrap_or_else(|_| PathBuf::from(w)));
-        let ws = req_ws.or_else(|| server_ws.clone());
+
+        if let (Some(sws), Some(rws)) = (&server_ws, &req_ws) {
+            if !rws.starts_with(sws) {
+                let mut prob_map = std::collections::HashMap::new();
+                prob_map.insert("DENY".to_string(), 1.0);
+                return Ok(DecisionResponse {
+                    version: Some("1.0".to_string()),
+                    decision: "DENY".to_string(),
+                    reasoning: Some(format!(
+                        "Request workspace '{}' is outside the server-authorized workspace root '{}'.",
+                        rws.display(), sws.display()
+                    )),
+                    probability: Some(1.0),
+                    probabilities: Some(prob_map),
+                    matched_rule: Some("WORKSPACE_CONTAINMENT_VIOLATION".to_string()),
+                    risk_category: Some("path_containment".to_string()),
+                    enforcement_action: Some("deny".to_string()),
+                    tier: Some("tier_0_hard_invariant".to_string()),
+                    temperature: Some(0.0),
+                    logits: None,
+                    is_error: false,
+                });
+            }
+        }
+
+        // Policy lookup target: use the specific requested project if provided, falling back to server_ws.
+        let target_ws = req_ws.as_ref().or(server_ws.as_ref());
+        // Containment root: when server_ws is configured, it is authoritative; otherwise use req_ws.
+        let containment_ws = server_ws.as_ref().or(req_ws.as_ref());
         let mut policy = engine.get_policy_clone();
 
-        if let Some(ref target_ws) = ws {
+        if let Some(target_ws) = target_ws {
             if target_ws.exists() {
                 let global_config = crate::paths::get_laya_config_dir();
                 let trust_file = global_config.join("trusted-manifests").join("trusted_projects.json");
@@ -753,10 +782,10 @@ async fn decide_handler(
                 // Security: verify policy content hash atomically against trust registry before loading.
                 if let Some((content, trusted_by_hash, policy_path)) = crate::policy_cmd::verify_and_read_project_policy(target_ws, &trust_file) {
                     // Only grant is_trusted if the server has an authoritative workspace configured,
-                    // the request workspace matches it, AND the policy hash is trusted.
+                    // the target workspace is inside it, AND its hash matches the trust registry.
                     // When server_ws is None, no trust is granted — the request workspace is untrusted input.
                     let is_trusted = match server_ws.as_ref() {
-                        Some(sws) => sws == target_ws && trusted_by_hash,
+                        Some(sws) => (sws == target_ws || target_ws.starts_with(sws)) && trusted_by_hash,
                         None => false,
                     };
 
@@ -791,7 +820,7 @@ async fn decide_handler(
             }
         }
 
-        engine.decide_with_policy(&payload, &policy, ws.as_deref())
+        engine.decide_with_policy(&payload, &policy, containment_ws.map(|p| p.as_path()))
     })
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Task join error: {}", e)))?

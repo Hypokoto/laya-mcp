@@ -250,7 +250,10 @@ fn compile_rule(r: &RawRule, is_trusted: bool) -> Result<Option<CompiledRule>, S
     }
 
     if action == "ALLOW" && cmd_re.is_none() && path_re.is_none() {
-        return Ok(None);
+        return Err(format!(
+            "Rule '{}' is an ALLOW with only a tool matcher and no command/path constraint — ignored for safety",
+            name
+        ));
     }
 
     Ok(Some(CompiledRule {
@@ -837,6 +840,33 @@ pathPattern = ".*(\\.env\\.production|prod\\.secrets|id_rsa|id_ed25519|\\.ssh/|\
         assert_eq!(engine.evaluate("run_command", &sens_diff, None), Some(("DENY", "block-git-sensitive-paths")));
 
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_tool_only_allow_is_skipped_with_warning_while_retaining_other_rules() {
+        let mut engine = PolicyEngine::new();
+        let policy_str = r#"
+version = "1.0"
+name = "mixed-rules"
+
+[[rules]]
+name = "bad-tool-only-allow"
+action = "ALLOW"
+tool = "run_command"
+
+[[rules]]
+name = "good-deny-rule"
+action = "DENY"
+commandPattern = "^evil_tool.*"
+"#;
+        let warnings = engine.load_project_override_str(policy_str, true, true).expect("Policy loading should succeed with warnings");
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("bad-tool-only-allow"));
+        assert!(warnings[0].contains("ignored for safety"));
+
+        // Ensure good-deny-rule was NOT dropped and remains active
+        let evil_cmd = json!({ "CommandLine": "evil_tool --hack" });
+        assert_eq!(engine.evaluate("run_command", &evil_cmd, None), Some(("DENY", "good-deny-rule")));
     }
 }
 

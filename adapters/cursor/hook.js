@@ -90,13 +90,13 @@ async function main() {
     } catch (err) {
         console.log(JSON.stringify({
             allow: false,
-            ask: true,
-            permission: 'ask',
-            message: `Laya Policy Engine error: ${err.message}. Confirm action manually.`,
-            userMessage: `Laya Policy Engine error: ${err.message}. Confirm action manually.`,
-            agentMessage: 'Policy engine offline or errored',
-            user_message: `Laya Policy Engine error: ${err.message}. Confirm action manually.`,
-            agent_message: 'Policy engine offline or errored',
+            ask: false,
+            permission: 'deny',
+            message: `Laya Policy Engine error: ${err.message}. Failing closed.`,
+            userMessage: `Laya Policy Engine error: ${err.message}. Action denied for safety.`,
+            agentMessage: 'Policy engine offline or errored — action denied (fail-closed)',
+            user_message: `Laya Policy Engine error: ${err.message}. Action denied for safety.`,
+            agent_message: 'Policy engine offline or errored — action denied (fail-closed)',
         }));
         process.exit(0);
     }

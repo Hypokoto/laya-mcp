@@ -1,0 +1,25 @@
+[package]
+name = "laya-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "laya"
+path = "src/main.rs"
+
+[dependencies]
+laya-core = { workspace = true }
+laya-preprocess = { workspace = true }
+laya-onnx = { workspace = true }
+ort = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }
+axum = { workspace = true }
+tower-http = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }

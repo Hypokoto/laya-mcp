@@ -1,0 +1,14 @@
+[package]
+name = "laya-preprocess"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+laya-core = { workspace = true }
+tokenizers = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+regex = { workspace = true }

@@ -1,26 +1,59 @@
-# Laya MCP Server & Policy Engine
+# Laya ONNX & Policy Engine
 
 This repository provides a complete, self-contained local AI system for evaluating policies, scoring data, and securing autonomous agent actions using the **Laya Decision Model** (ONNX).
 
-It features a dual-layer architecture:
-1. **Python Policy Engine (`laya_runtime`)**: An incredibly fast FastAPI backend that runs the 421M parameter Laya ONNX graph via `onnxruntime`.
-2. **TypeScript MCP Server (`laya-mcp`)**: A Model Context Protocol server that intercepts agent actions (file ops, commands) for security checks, and exposes tree-sitter codebase analysis and active decision tools.
+It features a high-performance multi-tiered architecture:
+1. **Native Rust Runtime & Daemon (`crates/`)**:
+   - High-throughput native Rust engine powered by `ort` (ONNX Runtime C++ bindings).
+   - Ultra-fast policy evaluation: **0.4ms** (Tier 1 rules: >2,300 ops/sec).
+   - High-performance INT8 CPU inference: **~114ms** p50 latency on standard CPU cores.
+   - Axum HTTP server on `:8000`: Drop-in replacement for legacy Python FastAPI with only **~774 MB RSS** memory footprint (saving >1.5 GB RAM on 8 GB systems).
+   - Standalone CLI (`laya`) for inspecting models, executing decisions, benchmarking, and serving.
+2. **TypeScript MCP Server (`laya-mcp`)**:
+   - Model Context Protocol server exposing active decision making, security auditing, and tree-sitter AST queries.
+   - Seamless dual-runtime client: connects to native Rust on `:8000` with zero-setup in-process WebAssembly fallback.
+3. **Universal PreToolUse Decision Hook (`hooks/laya-pretool-hook.js`)**:
+   - Hardcoded interceptor for AI harnesses (Antigravity, Cursor, Claude Code) with session authorization caching and destructive command isolation.
 
 ---
 
-## ⚡ Quickstart (One-Command Setup)
+## ⚡ Native Rust Runtime (`laya`)
 
-To automatically provision the Python environment, download model weights (~1.7GB), compile the TypeScript MCP server, register your installed AI harnesses, and run verification:
+The native Rust engine is organized as a Cargo monorepo workspace under `crates/`:
+- `crates/laya-core`: Decision data types, config, traits, and 3-tier policy engine.
+- `crates/laya-preprocess`: HuggingFace tokenizer integration and exact sequence builder.
+- `crates/laya-onnx`: ONNX Runtime session execution, tensor mapping, and calibration.
+- `crates/laya-cli`: Standalone CLI executable.
 
+### Build
 ```bash
-git clone https://github.com/Hypokoto/laya-mcp.git
-cd laya-mcp
-./install.sh
+cargo build --release
+# Executable produced at ./target/release/laya
 ```
 
----
+### CLI Commands
+```bash
+# 1. Inspect ONNX model graph structure, inputs, and outputs
+./target/release/laya inspect
 
-## 🛠 Manual Installation & Model Download
+# 2. Run single decision query via CLI arguments
+./target/release/laya decide --tool run_command --args '{"command": "git status"}'
+
+# 3. Benchmark warm latency, throughput, and 100 adversarial stress cases
+./target/release/laya bench --iterations 500
+./target/release/laya bench --test-file laya_100_audit_report.json
+
+# 4. Start high-speed native Axum HTTP daemon on :8000
+./target/release/laya serve --port 8000
+```
+
+### Benchmark Highlights (INT8 CPU)
+- **Model Load Time**: ~2.78 seconds (557 MB INT8 ONNX)
+- **Tier 1 Declarative Fast-Path**: 0.428 ms avg latency (2,338 decisions/sec)
+- **Tier 2 Neural ONNX Inference**: 114.18 ms p50 median latency on CPU
+- **Memory Footprint**: ~774 MB RSS (vs ~2.2 GB in Python)
+
+---
 
 ### 1. Download Model Weights (~1.7GB)
 

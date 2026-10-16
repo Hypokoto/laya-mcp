@@ -1,6 +1,6 @@
 use laya_core::error::{LayaError, Result};
-use laya_core::policy::{check_emergency_invariants, PolicyEngine};
-use laya_core::types::{DecisionRequest, DecisionResponse, LayaConfig, QType};
+use laya_core::policy::{check_tier0_invariants, PolicyEngine};
+use laya_core::types::{DecisionRequest, DecisionResponse, LayaConfig, PolicyTier, QType};
 use laya_preprocess::sequence::build_sequence;
 use laya_preprocess::tokenizer::LayaTokenizer;
 use ort::logging::LogLevel;
@@ -78,8 +78,8 @@ impl LayaEngine {
     }
 
     pub fn decide(&self, req: &DecisionRequest) -> Result<DecisionResponse> {
-        // 1. Emergency Invariants Safety Net (Tier 1 Precedence)
-        if let Some(emergency_verdict) = check_emergency_invariants(&req.tool, &req.args) {
+        // Tier 0: Hard Invariants & Self-Protection (Deterministic, zero ML, non-negotiable)
+        if let Some((emergency_verdict, invariant_name)) = check_tier0_invariants(&req.tool, &req.args) {
             if emergency_verdict == "DENY" {
                 let mut prob_map = HashMap::new();
                 prob_map.insert("DENY".to_string(), 1.0);
@@ -88,10 +88,11 @@ impl LayaEngine {
 
                 return Ok(DecisionResponse {
                     decision: "DENY".to_string(),
-                    reasoning: Some("Emergency safety net overrule: caught catastrophic DENY invariant violation.".to_string()),
+                    reasoning: Some("Tier 0 hard security invariant overrule: catastrophic command violation.".to_string()),
                     probability: Some(1.0),
                     probabilities: Some(prob_map),
-                    matched_rule: Some("EMERGENCY_INVARIANT_DENY".to_string()),
+                    matched_rule: Some(invariant_name.to_string()),
+                    tier: Some(PolicyTier::Tier0HardInvariant.as_str().to_string()),
                     temperature: Some(1.0),
                     logits: None,
                     is_error: false,
@@ -112,6 +113,7 @@ impl LayaEngine {
                             probability: Some(1.0),
                             probabilities: Some(prob_map),
                             matched_rule: Some(rule_name.to_string()),
+                            tier: Some(PolicyTier::Tier1DeterministicFastPath.as_str().to_string()),
                             temperature: Some(1.0),
                             logits: None,
                             is_error: false,
@@ -126,10 +128,11 @@ impl LayaEngine {
 
                 return Ok(DecisionResponse {
                     decision: "REQUIRE_AUTHORIZATION".to_string(),
-                    reasoning: Some("Emergency safety net overrule: self-protection or sensitive action invariant violation.".to_string()),
+                    reasoning: Some("Tier 0 hard invariant overrule: self-protection or sensitive operation invariant violation.".to_string()),
                     probability: Some(1.0),
                     probabilities: Some(prob_map),
-                    matched_rule: Some("EMERGENCY_INVARIANT_REQUIRE_AUTH".to_string()),
+                    matched_rule: Some(invariant_name.to_string()),
+                    tier: Some(PolicyTier::Tier0HardInvariant.as_str().to_string()),
                     temperature: Some(1.0),
                     logits: None,
                     is_error: false,
@@ -137,7 +140,7 @@ impl LayaEngine {
             }
         }
 
-        // 2. Declarative User Rules Engine (Tier 2 Precedence)
+        // Tier 1: Declarative Fast-Path & User Rules Engine
         {
             let policy = self.policy.read().unwrap();
             let rule_match = policy.evaluate(&req.tool, &req.args, self.workspace_root.as_deref());
@@ -153,6 +156,7 @@ impl LayaEngine {
                     probability: Some(1.0),
                     probabilities: Some(prob_map),
                     matched_rule: Some(rule_name.to_string()),
+                    tier: Some(PolicyTier::Tier1DeterministicFastPath.as_str().to_string()),
                     temperature: Some(1.0),
                     logits: None,
                     is_error: false,
@@ -160,7 +164,7 @@ impl LayaEngine {
             }
         }
 
-        // 3. Neural Brain Inference (Tier 3)
+        // Tier 2: Neural Brain Inference (ModernBERT Calibrated Risk Assessment)
         let (dynamic_context, dynamic_criteria) = synthesize_dynamic_criteria(&req.tool, &req.args);
 
         let criteria = match &req.criteria {
@@ -193,6 +197,7 @@ impl LayaEngine {
                 probability: Some(1.0),
                 probabilities: Some(prob_map),
                 matched_rule: Some("TRUNCATION_ESCALATION".to_string()),
+                tier: Some(PolicyTier::Tier2NeuralRiskAssessment.as_str().to_string()),
                 temperature: Some(1.0),
                 logits: None,
                 is_error: false,
@@ -265,10 +270,23 @@ impl LayaEngine {
 
         let mut decision = seq.option_keys.get(best_idx).cloned().unwrap_or_else(|| "DENY".to_string());
 
-        let tau = std::env::var("LAYA_ALLOW_THRESHOLD")
+        let is_shell_tool = is_shell_execution_tool(&req.tool);
+        let is_file_tool = is_file_mutation_tool(&req.tool);
+
+        let domain_threshold = if is_shell_tool {
+            &self.config.thresholds.shell
+        } else if is_file_tool {
+            &self.config.thresholds.file
+        } else {
+            &self.config.thresholds.default
+        };
+
+        let tau_allow = std::env::var("LAYA_ALLOW_THRESHOLD")
             .ok()
             .and_then(|v| v.parse::<f32>().ok())
-            .unwrap_or(0.60);
+            .unwrap_or(domain_threshold.allow_min_prob);
+        let tau_deny = domain_threshold.deny_max_prob;
+        let tau_req = domain_threshold.require_auth_max_prob;
 
         let deny_prob = prob_map.get("DENY").copied().unwrap_or(0.0);
         let req_prob = prob_map.get("REQUIRE_AUTHORIZATION").copied().unwrap_or(0.0);
@@ -282,13 +300,13 @@ impl LayaEngine {
 
         if decision == "ALLOW"
             && criteria.contains_key("REQUIRE_AUTHORIZATION")
-            && (best_prob < tau || deny_prob > 0.25 || req_prob > 0.35)
+            && (best_prob < tau_allow || deny_prob > tau_deny || req_prob > tau_req)
         {
             decision = "REQUIRE_AUTHORIZATION".to_string();
             reasoning = format!(
-                "Calibrated ALLOW probability {:.1}% is below security threshold ({:.0}%) or risk margins exceeded (DENY={:.1}%, REQ={:.1}%); escalated to human authorization.",
+                "Calibrated ALLOW probability {:.1}% is below domain threshold ({:.0}%) or risk margins exceeded (DENY={:.1}%, REQ={:.1}%); escalated to human authorization.",
                 best_prob * 100.0,
-                tau * 100.0,
+                tau_allow * 100.0,
                 deny_prob * 100.0,
                 req_prob * 100.0
             );
@@ -300,6 +318,7 @@ impl LayaEngine {
             probability: Some(best_prob),
             probabilities: Some(prob_map),
             matched_rule: None,
+            tier: Some(PolicyTier::Tier2NeuralRiskAssessment.as_str().to_string()),
             temperature: Some(t),
             logits: Some(logits_slice.to_vec()),
             is_error: false,
@@ -307,19 +326,32 @@ impl LayaEngine {
     }
 }
 
-fn synthesize_dynamic_criteria(tool: &str, args: &serde_json::Value) -> (String, HashMap<String, String>) {
+pub fn is_shell_execution_tool(tool: &str) -> bool {
     let tool_lower = tool.to_lowercase();
-    let is_shell = matches!(
+    matches!(
         tool_lower.as_str(),
         "run_command" | "bash" | "terminal" | "shell" | "execute_command" | "laya_run_command"
-    );
-    let is_file_mut = tool_lower.starts_with("write")
+    )
+}
+
+pub fn is_file_mutation_tool(tool: &str) -> bool {
+    let tool_lower = tool.to_lowercase();
+    tool_lower.starts_with("write")
         || tool_lower.starts_with("edit")
         || tool_lower.starts_with("replace")
         || tool_lower.starts_with("append")
         || tool_lower.starts_with("delete")
         || tool_lower.starts_with("remove")
-        || tool_lower.starts_with("laya_write_file");
+        || tool_lower.starts_with("laya_write_file")
+        || tool_lower.contains("write_file")
+        || tool_lower.contains("edit_file")
+        || tool_lower.contains("remove_file")
+        || tool_lower.contains("delete_file")
+}
+
+fn synthesize_dynamic_criteria(tool: &str, args: &serde_json::Value) -> (String, HashMap<String, String>) {
+    let is_shell = is_shell_execution_tool(tool);
+    let is_file_mut = is_file_mutation_tool(tool);
 
     let cmd_str = args
         .get("CommandLine")

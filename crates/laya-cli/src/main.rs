@@ -100,6 +100,17 @@ enum Commands {
         #[arg(long, default_value = "127.0.0.1")]
         host: String,
     },
+
+    /// Verify cryptographic artifact hashes against supplied model_manifest.json
+    VerifyManifest {
+        /// Path to model_manifest.json
+        #[arg(short, long)]
+        manifest: Option<PathBuf>,
+
+        /// Expected SHA-256 digest of the manifest itself for cryptographic provenance authentication
+        #[arg(long, env = "LAYA_MANIFEST_DIGEST")]
+        trusted_digest: Option<String>,
+    },
 }
 
 fn resolve_default_paths(
@@ -436,6 +447,109 @@ async fn main() -> Result<()> {
 
             let listener = tokio::net::TcpListener::bind(addr).await?;
             axum::serve(listener, app).await?;
+        }
+
+        Commands::VerifyManifest { manifest, trusted_digest } => {
+            let manifest_path = manifest.unwrap_or_else(|| {
+                let repo_root = PathBuf::from(std::env::var("LAYA_HOME").unwrap_or_else(|_| ".".to_string()));
+                repo_root.join("model_manifest.json")
+            });
+
+            println!("================================================================================");
+            println!("🔒 LAYA ARTIFACT CHECKSUM VERIFICATION");
+            println!("================================================================================");
+            println!("Manifest: {}", manifest_path.display());
+
+            if !manifest_path.exists() {
+                eprintln!("Error: Manifest file not found at {}", manifest_path.display());
+                std::process::exit(1);
+            }
+
+            let manifest_content = fs::read_to_string(&manifest_path)?;
+            use sha2::{Digest, Sha256};
+            let computed_manifest_digest = hex::encode(Sha256::digest(manifest_content.as_bytes()));
+            println!("Manifest SHA-256: {}", computed_manifest_digest);
+
+            let mut manifest_authenticated = false;
+            if let Some(ref expected) = trusted_digest {
+                if computed_manifest_digest.eq_ignore_ascii_case(expected) {
+                    manifest_authenticated = true;
+                    println!("Manifest Auth:    Authenticated against trusted digest ({})", &expected[..16]);
+                } else {
+                    eprintln!("❌ MANIFEST AUTHENTICATION FAILED: Digest does not match trusted reference!");
+                    eprintln!("   Expected: {}", expected);
+                    eprintln!("   Computed: {}", computed_manifest_digest);
+                    std::process::exit(1);
+                }
+            } else {
+                println!("Manifest Auth:    No external digest supplied (verifying relative checksums only)");
+            }
+
+            let manifest_json: Value = serde_json::from_str(&manifest_content)?;
+
+            let model_name = manifest_json["model_identity"]["name"].as_str().unwrap_or("unknown");
+            let commit = manifest_json["model_identity"]["pinned_revision"].as_str().unwrap_or("unknown");
+
+            println!("Declared Model:  {}", model_name);
+            println!("Declared Commit: {}", commit);
+            println!("--------------------------------------------------------------------------------");
+
+            let artifacts = manifest_json["artifacts"]
+                .as_object()
+                .context("Malformed manifest: missing 'artifacts' object")?;
+
+            if artifacts.is_empty() {
+                eprintln!("Error: Manifest contains no artifacts to verify.");
+                std::process::exit(1);
+            }
+
+            let repo_root = manifest_path.parent().unwrap_or_else(|| std::path::Path::new("."));
+            let mut all_valid = true;
+
+            for (key, val) in artifacts {
+                let rel_path = val["path"].as_str().unwrap_or("");
+                let expected_hash = val["sha256"].as_str().unwrap_or("");
+                let full_path = repo_root.join(rel_path);
+
+                if !full_path.exists() {
+                    println!("  [✗] {:<18} Missing file: {}", key, full_path.display());
+                    all_valid = false;
+                    continue;
+                }
+
+                let mut file = fs::File::open(&full_path)?;
+                let mut hasher = Sha256::new();
+                let mut buffer = [0u8; 65536];
+                loop {
+                    let n = file.read(&mut buffer)?;
+                    if n == 0 {
+                        break;
+                    }
+                    hasher.update(&buffer[..n]);
+                }
+                let actual_hash = hex::encode(hasher.finalize());
+
+                if actual_hash.eq_ignore_ascii_case(expected_hash) {
+                    println!("  [✓] {:<18} Match: {} ({})", key, rel_path, &actual_hash[..16]);
+                } else {
+                    println!("  [✗] {:<18} CHECKSUM MISMATCH: {}", key, rel_path);
+                    println!("       Expected: {}", expected_hash);
+                    println!("       Actual:   {}", actual_hash);
+                    all_valid = false;
+                }
+            }
+
+            println!("================================================================================");
+            if all_valid {
+                if manifest_authenticated {
+                    println!("🎉 ALL ARTIFACTS VERIFIED: Checksums match and manifest authenticated against trusted digest!");
+                } else {
+                    println!("✓ ARTIFACT CHECKSUMS VERIFIED: All artifact checksums match the supplied manifest.");
+                }
+            } else {
+                eprintln!("❌ VERIFICATION FAILED: One or more artifacts failed checksum verification.");
+                std::process::exit(1);
+            }
         }
     }
 

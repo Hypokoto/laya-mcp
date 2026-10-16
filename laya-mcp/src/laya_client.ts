@@ -27,15 +27,48 @@ export interface DecisionResponse {
 const getRuntimeUrl = () => process.env.LAYA_RUNTIME_URL || "http://127.0.0.1:8000";
 
 /**
- * Checks if the Laya Python runtime is healthy and ready to serve inferences.
+ * Checks if the Laya runtime (Native Rust Axum or Python FastAPI) is healthy and ready to serve inferences.
  */
 export async function isRuntimeHealthy(): Promise<boolean> {
+    let isMissingOrUnreachable = false;
     try {
         const controller = new AbortController();
         const timeout = setTimeout(() => controller.abort(), 1500);
-        const res = await fetch(`${getRuntimeUrl()}/openapi.json`, { signal: controller.signal });
-        clearTimeout(timeout);
-        return res.status === 200;
+        try {
+            const res = await fetch(`${getRuntimeUrl()}/health`, { signal: controller.signal });
+            if (res.status === 200) {
+                try {
+                    const data: any = await res.json();
+                    return data?.status === "healthy" || data?.status === "ok";
+                } catch {
+                    return false;
+                }
+            }
+            if (res.status === 404) {
+                isMissingOrUnreachable = true;
+            } else {
+                return false;
+            }
+        } finally {
+            clearTimeout(timeout);
+        }
+    } catch {
+        isMissingOrUnreachable = true;
+    }
+
+    if (!isMissingOrUnreachable) {
+        return false;
+    }
+
+    try {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 1500);
+        try {
+            const res = await fetch(`${getRuntimeUrl()}/openapi.json`, { signal: controller.signal });
+            return res.status === 200;
+        } finally {
+            clearTimeout(timeout);
+        }
     } catch {
         return false;
     }

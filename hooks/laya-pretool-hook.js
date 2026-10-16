@@ -1,11 +1,17 @@
 #!/usr/bin/env node
 /**
- * Laya ONNX Policy Engine — Universal PreToolUse Decision Hook
+ * Laya ONNX Policy Engine — Universal PreToolUse & PostToolUse Interceptor Hook
  * 
- * Intercepts tool calls before execution in AI harnesses (Antigravity, Cursor, Claude Code, Cline).
- * - Fast-paths read-only tools (0ms overhead).
- * - Queries Laya ONNX decision model via stdio MCP protocol for mutating actions.
- * - Blocks destructive actions (DENY) or actions requiring human authorization.
+ * Intercepts tool calls before execution across AI harnesses:
+ * - Antigravity IDE & CLI (BeforeTool / AfterTool, PreToolUse / PostToolUse)
+ * - Cursor IDE (beforeToolUse / afterToolUse)
+ * - Claude Code & Cline (PreToolUse / PostToolUse)
+ * 
+ * Policy Architecture:
+ * - Tier 0: Hard Invariants & Self-Protection (Deterministic, zero ML, non-negotiable)
+ * - Tier 1: Deterministic Fast-Path (<1ms in-process, ~15-25ms CLI process startup) & Session Approval Cache
+ * - Tier 2: Neural Risk Assessment (Calibrated ModernBERT advisory inference, fails closed on uncertainty)
+ * - Tier 3: Execution Enforcement & Audit Logging across host adapters
  */
 
 'use strict';
@@ -18,8 +24,11 @@ const os = require('os');
 
 const READONLY_EXACT_RE = /^(view_file|read_file|laya_read_file|read_files|laya_read_files|read|grep|search_files|search_web|read_url_content|list_dir|listdir|ls|glob)$/i;
 
-// Self-protection regex for policy engine and harness configurations
+// Self-protection regex for policy engine and harness configurations (Tier 0 invariant)
 const PROTECTED_TARGETS_RE = /(hooks\/laya-pretool-hook\.js|laya_runtime\/|laya_config\.json|laya_rules\.json|\.laya\/|\.claude\/settings\.json|\.gemini\/)/i;
+
+// Session authorization TTL: 1 hour default
+const DEFAULT_AUTH_TTL_MS = 60 * 60 * 1000;
 
 /**
  * Sanitizes and truncates tool arguments for policy evaluation.
@@ -40,6 +49,18 @@ function sanitizeArgsForPolicy(toolName, args) {
 }
 
 /**
+ * Resolves the target workspace root directory.
+ */
+function resolveActionCwd(toolArgs, raw) {
+    const candidate = toolArgs?.cwd || toolArgs?.Cwd || raw?.workspace_root || raw?.workspaceRoot || process.cwd();
+    try {
+        return fs.realpathSync(candidate);
+    } catch {
+        return path.resolve(candidate);
+    }
+}
+
+/**
  * Resolves the path to the laya-mcp server entry point.
  */
 function resolveLayaMcpPath() {
@@ -56,14 +77,15 @@ function resolveLayaMcpPath() {
 
 /**
  * Computes a deterministic SHA-256 action signature for session authorization caching.
- * Includes all arguments (e.g. file content, flags) so payload variations produce distinct signatures.
+ * Binds workspace root, tool name, command, filepath, and arguments to prevent cross-workspace replays.
  */
-function computeActionSignature(toolName, toolArgs) {
+function computeActionSignature(toolName, toolArgs, workspaceRoot = '') {
     const normTool = (toolName || '').toLowerCase().trim();
     const cmd = (toolArgs?.CommandLine || toolArgs?.command || toolArgs?.cmd || '').trim();
     const filePath = (toolArgs?.filepath || toolArgs?.path || toolArgs?.file_path || toolArgs?.TargetFile || '').trim();
     const argsStr = JSON.stringify(toolArgs || {});
-    const sigPayload = `${normTool}::${cmd}::${filePath}::${argsStr}`;
+    const normRoot = (workspaceRoot || '').trim();
+    const sigPayload = `${normRoot}::${normTool}::${cmd}::${filePath}::${argsStr}`;
     return crypto.createHash('sha256').update(sigPayload).digest('hex');
 }
 
@@ -81,16 +103,28 @@ function getSessionCachePath(sessionId) {
 }
 
 /**
- * Checks if an action signature was explicitly approved in this session.
+ * Checks if an action signature was explicitly approved in this session and has not expired.
  */
-function isActionCachedApproved(sessionId, sig) {
+function isActionCachedApproved(sessionId, sig, workspaceRoot = '') {
     if (!sessionId || !sig) return false;
     try {
         const cacheFile = getSessionCachePath(sessionId);
         if (cacheFile && fs.existsSync(cacheFile)) {
             const data = JSON.parse(fs.readFileSync(cacheFile, 'utf8'));
-            if (Array.isArray(data.approved) && data.approved.includes(sig)) {
-                return true;
+            if (Array.isArray(data.approved)) {
+                const now = Date.now();
+                return data.approved.some((entry) => {
+                    if (typeof entry === 'string') {
+                        return entry === sig;
+                    }
+                    if (entry && typeof entry === 'object') {
+                        const sigMatches = entry.sig === sig;
+                        const notExpired = typeof entry.expires_at === 'number' ? entry.expires_at > now : true;
+                        const rootMatches = !entry.workspace_root || !workspaceRoot || entry.workspace_root === workspaceRoot;
+                        return sigMatches && notExpired && rootMatches;
+                    }
+                    return false;
+                });
             }
         }
     } catch {}
@@ -122,8 +156,9 @@ function recordPendingAuthorization(sessionId, sig) {
 
 /**
  * Confirms a pending authorization when PostToolUse verifies successful tool execution.
+ * Binds approval to workspace root and expiration timestamp.
  */
-function confirmPendingAuthorization(sessionId, sig) {
+function confirmPendingAuthorization(sessionId, sig, workspaceRoot = '') {
     if (!sessionId || !sig) return false;
     try {
         const cacheFile = getSessionCachePath(sessionId);
@@ -140,8 +175,18 @@ function confirmPendingAuthorization(sessionId, sig) {
         // Only promote if it was genuinely pending authorization
         if (data.pending.includes(sig)) {
             data.pending = data.pending.filter((s) => s !== sig);
-            if (!data.approved.includes(sig)) {
-                data.approved.push(sig);
+            const newEntry = {
+                sig,
+                workspace_root: workspaceRoot || '',
+                expires_at: Date.now() + DEFAULT_AUTH_TTL_MS,
+                approved_at: new Date().toISOString()
+            };
+            const existingIdx = data.approved.findIndex((item) => (typeof item === 'string' ? item : item?.sig) === sig);
+            if (existingIdx >= 0) {
+                // Refresh existing/expired approval with renewed human consent
+                data.approved[existingIdx] = newEntry;
+            } else {
+                data.approved.push(newEntry);
             }
             fs.writeFileSync(cacheFile, JSON.stringify(data, null, 2), { mode: 0o600 });
             return true;
@@ -151,18 +196,19 @@ function confirmPendingAuthorization(sessionId, sig) {
 }
 
 /**
- * Normalizes tool name, arguments, and session ID from various harness payload formats.
+ * Normalizes tool name, arguments, session ID, and workspace root from various harness payload formats.
  */
 function normalizePayload(raw) {
     let toolName = raw.tool_name || raw.toolName || raw.name || raw.tool || '';
     let toolArgs = raw.tool_input || raw.toolInput || raw.arguments || raw.args || {};
     let sessionId = raw.session_id || raw.sessionId || raw.conversation_id || raw.conversationId || process.env.LAYA_SESSION_ID || null;
+    let workspaceRoot = resolveActionCwd(toolArgs, raw);
 
     if (typeof toolName === 'string' && toolName.includes(':')) {
         toolName = toolName.slice(toolName.lastIndexOf(':') + 1);
     }
 
-    return { toolName, toolArgs, sessionId };
+    return { toolName, toolArgs, sessionId, workspaceRoot };
 }
 
 const RUNTIME_URL = process.env.LAYA_RUNTIME_URL || 'http://127.0.0.1:8000';
@@ -310,7 +356,7 @@ function main() {
 
         try {
             const parsed = JSON.parse(rawInput);
-            const { toolName, toolArgs, sessionId } = normalizePayload(parsed);
+            const { toolName, toolArgs, sessionId, workspaceRoot } = normalizePayload(parsed);
 
             // 0. Confirmed Approval / PostToolUse Recording:
             // Promote a pending signature ONLY when the harness delivers a genuine post-tool event
@@ -328,8 +374,8 @@ function main() {
             if (isPostTool) {
                 const targetStr = JSON.stringify(toolArgs);
                 if (hasExplicitHumanConsent && sessionId && !PROTECTED_TARGETS_RE.test(targetStr)) {
-                    const actionSig = computeActionSignature(toolName, toolArgs);
-                    const confirmed = confirmPendingAuthorization(sessionId, actionSig);
+                    const actionSig = computeActionSignature(toolName, toolArgs, workspaceRoot);
+                    const confirmed = confirmPendingAuthorization(sessionId, actionSig, workspaceRoot);
                     if (confirmed) {
                         console.error(`Laya Hook: Recorded approved action in session cache (${sessionId.slice(0, 8)}...): ${toolName}`);
                     }
@@ -343,8 +389,8 @@ function main() {
             }
 
             // 2. Session Approval Cache: Check if user already approved this exact action in this session
-            const actionSig = computeActionSignature(toolName, toolArgs);
-            if (isActionCachedApproved(sessionId, actionSig)) {
+            const actionSig = computeActionSignature(toolName, toolArgs, workspaceRoot);
+            if (isActionCachedApproved(sessionId, actionSig, workspaceRoot)) {
                 console.error(`Laya PreToolUse Hook: Action pre-approved in session (${sessionId.slice(0, 8)}...): ${toolName}`);
                 process.exit(0);
             }
@@ -360,8 +406,10 @@ function main() {
                         permissionDecision: "ask",
                         permissionDecisionReason: selfProtectMsg
                     },
+                    permissionDecision: "ask",
                     decision: "REQUIRE_AUTHORIZATION",
-                    reason: selfProtectMsg
+                    reason: selfProtectMsg,
+                    tier: "tier_0_hard_invariant"
                 };
                 process.stdout.write(JSON.stringify(selfProtectPayload) + '\n');
                 if (process.env.LAYA_HOOK_BLOCK_ON_AUTH === "true") {
@@ -374,7 +422,7 @@ function main() {
             const sanitizedArgs = sanitizeArgsForPolicy(toolName, toolArgs);
 
             // 5. Evaluate with Laya ONNX Engine
-            const { decision, reasoning } = await queryLayaDecide(toolName, sanitizedArgs);
+            const { decision, reasoning, tier } = await queryLayaDecide(toolName, sanitizedArgs);
 
             if (decision === 'ALLOW') {
                 process.exit(0);
@@ -390,8 +438,10 @@ function main() {
                         permissionDecision: "ask",
                         permissionDecisionReason: askMsg
                     },
+                    permissionDecision: "ask",
                     decision: "REQUIRE_AUTHORIZATION",
-                    reason: askMsg
+                    reason: askMsg,
+                    tier: tier || "tier_2_neural_risk_assessment"
                 };
                 process.stdout.write(JSON.stringify(askPayload) + '\n');
                 if (process.env.LAYA_HOOK_BLOCK_ON_AUTH === "true") {
@@ -409,9 +459,11 @@ function main() {
                     permissionDecision: "deny",
                     permissionDecisionReason: denyMsg
                 },
+                permissionDecision: "deny",
                 block: true,
                 decision: "DENY",
-                reason: denyMsg
+                reason: denyMsg,
+                tier: tier || "tier_0_hard_invariant"
             };
             process.stdout.write(JSON.stringify(denyPayload) + '\n');
             process.exit(2);

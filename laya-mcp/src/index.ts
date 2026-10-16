@@ -59,38 +59,94 @@ let pythonSpawned = false;
 async function triggerPythonWarmup(): Promise<void> {
     if (pythonSpawned) return;
 
-    // Check if Python engine is already alive
+    // Check if runtime engine is already alive
     if (await isRuntimeHealthy()) {
-        console.error("✓ Laya Python ONNX Engine is active and ready.");
+        console.error("✓ Laya ONNX Engine is active and ready.");
         return;
     }
 
     pythonSpawned = true;
-    console.error("ℹ Laya Python ONNX Engine not detected. Warming up in background (takes ~15-20s)...");
-
     const layaHome = resolveLayaHome();
+    const nativeRelease = join(layaHome, "target/release/laya");
+    const nativeDebug = join(layaHome, "target/debug/laya");
+    const nativeBinary = fs.existsSync(nativeRelease) ? nativeRelease : (fs.existsSync(nativeDebug) ? nativeDebug : null);
+
     const layaRuntimeDir = join(layaHome, "laya_runtime");
     const venvPython = join(layaHome, ".venv/bin/python");
     const mainPy = join(layaRuntimeDir, "main.py");
-
     const pythonBin = fs.existsSync(venvPython) ? venvPython : "python3";
 
+    const useNative = Boolean(nativeBinary && process.env.LAYA_FORCE_PYTHON !== "1");
+    const spawnBin = useNative ? nativeBinary! : pythonBin;
+    const spawnArgs = useNative ? ["serve", "--port", "8000"] : [mainPy];
+    const spawnCwd = useNative ? layaHome : layaRuntimeDir;
+    const engineLabel = useNative ? "Native Rust Axum" : "Python ONNX";
+
+    console.error(`ℹ Laya Engine not detected. Warming up ${engineLabel} backend in background...`);
+
+    let isReady = false;
+    let fallbackTriggered = false;
+    let fallbackProc: any = null;
+
+    const triggerFallback = () => {
+        if (fallbackTriggered) return;
+        fallbackTriggered = true;
+        if (fs.existsSync(mainPy) || fs.existsSync(venvPython)) {
+            console.error("ℹ Falling back to Python ONNX backend...");
+            try {
+                fallbackProc = spawn(pythonBin, [mainPy], {
+                    cwd: layaRuntimeDir,
+                    stdio: "ignore",
+                    detached: true
+                });
+                fallbackProc.on("error", (pyErr: any) => {
+                    console.error(`⚠ Warning: Python fallback spawn failed: ${pyErr.message}`);
+                });
+                fallbackProc.unref();
+            } catch (fallbackErr: any) {
+                console.error(`⚠ Warning: Could not spawn Python fallback: ${fallbackErr.message}`);
+            }
+        }
+    };
+
     try {
-        const pythonProcess = spawn(pythonBin, [mainPy], {
-            cwd: layaRuntimeDir,
+        const daemonProcess = spawn(spawnBin, spawnArgs, {
+            cwd: spawnCwd,
             stdio: "ignore", // Prevent stdout interference with MCP stdio protocol
             detached: true
         });
 
-        pythonProcess.unref();
+        daemonProcess.on("error", (spawnErr: any) => {
+            console.error(`⚠ Warning: Failed to spawn ${engineLabel} process: ${spawnErr.message}`);
+            if (useNative) {
+                triggerFallback();
+            }
+        });
+
+        daemonProcess.on("exit", (code, signal) => {
+            if (!isReady && useNative) {
+                console.error(`⚠ Native engine process exited prematurely (code=${code}, signal=${signal}) before readiness.`);
+                triggerFallback();
+            }
+        });
+
+        daemonProcess.unref();
 
         const cleanup = () => {
             try {
-                if (pythonProcess.pid) process.kill(-pythonProcess.pid);
+                if (daemonProcess.pid) process.kill(-daemonProcess.pid);
             } catch {}
             try {
-                pythonProcess.kill();
+                daemonProcess.kill();
             } catch {}
+            if (fallbackProc) {
+                try {
+                    if (fallbackProc.pid) process.kill(-fallbackProc.pid);
+                } catch {}
+                try {
+                    fallbackProc.kill();
+                } catch {}
+            }
         };
 
         // Detached daemon persists across short-lived hook/tool invocations
@@ -103,16 +159,17 @@ async function triggerPythonWarmup(): Promise<void> {
         // Poll asynchronously in background
         const checkInterval = setInterval(async () => {
             if (await isRuntimeHealthy()) {
+                isReady = true;
                 clearInterval(checkInterval);
-                console.error("✓ Laya Python ONNX Engine is now online and serving inferences.");
+                console.error(`✓ Laya ${fallbackTriggered ? "Python ONNX" : engineLabel} Engine is now online and serving inferences.`);
             }
-        }, 1500);
+        }, 1000);
 
         // Stop polling after 45 seconds to avoid infinite timers
         setTimeout(() => clearInterval(checkInterval), 45000);
     } catch (err: any) {
-        console.error(`⚠ Warning: Could not auto-spawn Python backend: ${err.message}.`);
-        console.error(`  Please start the engine manually via: cd laya_runtime && python main.py`);
+        console.error(`⚠ Warning: Could not auto-spawn ${engineLabel} backend: ${err.message}.`);
+        console.error(`  Please start the engine manually via: ./target/release/laya serve --port 8000`);
     }
 }
 

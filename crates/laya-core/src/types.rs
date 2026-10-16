@@ -24,6 +24,29 @@ impl QType {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PolicyTier {
+    #[serde(rename = "tier_0_hard_invariant")]
+    Tier0HardInvariant,
+    #[serde(rename = "tier_1_deterministic_fast_path")]
+    Tier1DeterministicFastPath,
+    #[serde(rename = "tier_2_neural_risk_assessment")]
+    Tier2NeuralRiskAssessment,
+    #[serde(rename = "tier_3_enforcement_audit")]
+    Tier3EnforcementAudit,
+}
+
+impl PolicyTier {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            PolicyTier::Tier0HardInvariant => "tier_0_hard_invariant",
+            PolicyTier::Tier1DeterministicFastPath => "tier_1_deterministic_fast_path",
+            PolicyTier::Tier2NeuralRiskAssessment => "tier_2_neural_risk_assessment",
+            PolicyTier::Tier3EnforcementAudit => "tier_3_enforcement_audit",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DecisionRequest {
     pub tool: String,
@@ -46,11 +69,62 @@ pub struct DecisionResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub matched_rule: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub logits: Option<Vec<f32>>,
     #[serde(default)]
     pub is_error: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RiskThresholds {
+    pub allow_min_prob: f32,
+    pub deny_max_prob: f32,
+    pub require_auth_max_prob: f32,
+}
+
+impl RiskThresholds {
+    pub fn new(allow_min: f32, deny_max: f32, req_max: f32) -> Self {
+        Self {
+            allow_min_prob: allow_min,
+            deny_max_prob: deny_max,
+            require_auth_max_prob: req_max,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DomainThresholds {
+    #[serde(default = "default_shell_thresholds")]
+    pub shell: RiskThresholds,
+    #[serde(default = "default_file_thresholds")]
+    pub file: RiskThresholds,
+    #[serde(default = "default_general_thresholds")]
+    pub default: RiskThresholds,
+}
+
+fn default_shell_thresholds() -> RiskThresholds {
+    RiskThresholds::new(0.80, 0.10, 0.20)
+}
+
+fn default_file_thresholds() -> RiskThresholds {
+    RiskThresholds::new(0.70, 0.15, 0.25)
+}
+
+fn default_general_thresholds() -> RiskThresholds {
+    RiskThresholds::new(0.65, 0.20, 0.30)
+}
+
+impl Default for DomainThresholds {
+    fn default() -> Self {
+        Self {
+            shell: default_shell_thresholds(),
+            file: default_file_thresholds(),
+            default: default_general_thresholds(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -61,6 +135,8 @@ pub struct LayaConfig {
     pub head_max_len: usize,
     #[serde(default)]
     pub temperature_by_options: HashMap<String, f32>,
+    #[serde(default)]
+    pub thresholds: DomainThresholds,
 }
 
 fn default_max_len() -> usize {
@@ -85,6 +161,7 @@ impl Default for LayaConfig {
             max_len: 512,
             head_max_len: 192,
             temperature_by_options: map,
+            thresholds: DomainThresholds::default(),
         }
     }
 }

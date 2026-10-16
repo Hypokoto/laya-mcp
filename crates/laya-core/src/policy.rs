@@ -115,7 +115,9 @@ pub fn is_destructive_rm(cmd: &str) -> bool {
     false
 }
 
-pub fn check_emergency_invariants(tool: &str, args: &Value) -> Option<&'static str> {
+/// Tier 0: Hard Invariants & Self-Protection (Deterministic, zero ML, non-negotiable)
+/// Returns Some((verdict, invariant_rule_name)) if a hard security invariant is triggered.
+pub fn check_tier0_invariants(tool: &str, args: &Value) -> Option<(&'static str, &'static str)> {
     let cmd_str = args.get("CommandLine")
         .or_else(|| args.get("command"))
         .or_else(|| args.get("cmd"))
@@ -133,7 +135,7 @@ pub fn check_emergency_invariants(tool: &str, args: &Value) -> Option<&'static s
     if get_protected_paths_re().is_match(&combined_target) {
         let re_read = Regex::new(r"(?i)^(read|view|search|grep)").unwrap();
         if !re_read.is_match(tool) {
-            return Some("REQUIRE_AUTHORIZATION");
+            return Some(("REQUIRE_AUTHORIZATION", "TIER0_SELF_PROTECTION_INVARIANT"));
         }
     }
 
@@ -145,21 +147,26 @@ pub fn check_emergency_invariants(tool: &str, args: &Value) -> Option<&'static s
     if !target_cmd.is_empty() {
         let norm = normalize_shell_command(&target_cmd);
         if is_destructive_rm(&norm) {
-            return Some("DENY");
+            return Some(("DENY", "TIER0_DESTRUCTIVE_RM_INVARIANT"));
         }
         for rx in get_destructive_regexes() {
             if rx.is_match(&norm) {
-                return Some("DENY");
+                return Some(("DENY", "TIER0_DESTRUCTIVE_CMD_INVARIANT"));
             }
         }
         for rx in get_authorization_regexes() {
             if rx.is_match(&norm) {
-                return Some("REQUIRE_AUTHORIZATION");
+                return Some(("REQUIRE_AUTHORIZATION", "TIER0_SENSITIVE_CMD_INVARIANT"));
             }
         }
     }
 
     None
+}
+
+/// Backward-compatible wrapper for check_tier0_invariants
+pub fn check_emergency_invariants(tool: &str, args: &Value) -> Option<&'static str> {
+    check_tier0_invariants(tool, args).map(|(verdict, _)| verdict)
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -362,4 +369,95 @@ fn normalize_path(path: &Path) -> PathBuf {
         }
     }
     normalized
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_tier0_destructive_rm_denial() {
+        let destructive = vec![
+            "rm -rf /",
+            "rm -rf /*",
+            "rm -rf --no-preserve-root /",
+            "rm --recursive --force /",
+            "rm -rf .",
+            "rm -rf ./*",
+            "rm$IFS-rf$IFS/",
+        ];
+
+        for cmd in destructive {
+            let args = json!({ "CommandLine": cmd });
+            let res = check_tier0_invariants("run_command", &args);
+            assert!(res.is_some(), "Expected Tier 0 block for: {}", cmd);
+            let (verdict, rule) = res.unwrap();
+            assert_eq!(verdict, "DENY");
+            assert_eq!(rule, "TIER0_DESTRUCTIVE_RM_INVARIANT");
+        }
+    }
+
+    #[test]
+    fn test_tier0_safe_directory_cleanup_not_blocked() {
+        let safe_rm = vec![
+            "rm -rf /tmp/build",
+            "rm -rf target/debug",
+            "rm -rf node_modules/.cache",
+        ];
+
+        for cmd in safe_rm {
+            let args = json!({ "CommandLine": cmd });
+            let res = check_tier0_invariants("run_command", &args);
+            assert!(res.is_none(), "Unexpected Tier 0 block for safe cleanup: {}", cmd);
+        }
+    }
+
+    #[test]
+    fn test_tier0_destructive_system_commands() {
+        let cmds = vec![
+            "mkfs.ext4 /dev/sda1",
+            "dd if=/dev/zero of=/dev/sda",
+            ":(){ :|:& };:",
+            "chmod -R 777 /",
+        ];
+
+        for cmd in cmds {
+            let args = json!({ "CommandLine": cmd });
+            let res = check_tier0_invariants("run_command", &args);
+            assert!(res.is_some(), "Expected Tier 0 block for system command: {}", cmd);
+            let (verdict, _) = res.unwrap();
+            assert_eq!(verdict, "DENY");
+        }
+    }
+
+    #[test]
+    fn test_tier0_self_protection() {
+        let sensitive_targets = vec![
+            ("write_file", json!({ "filepath": "hooks/laya-pretool-hook.js", "content": "bad" })),
+            ("replace_file_content", json!({ "TargetFile": "laya_config.json" })),
+            ("run_command", json!({ "CommandLine": "sed -i 's/foo/bar/' .claude/settings.json" })),
+        ];
+
+        for (tool, args) in sensitive_targets {
+            let res = check_tier0_invariants(tool, &args);
+            assert!(res.is_some(), "Expected Tier 0 self-protection for tool {}", tool);
+            let (verdict, rule) = res.unwrap();
+            assert_eq!(verdict, "REQUIRE_AUTHORIZATION");
+            assert_eq!(rule, "TIER0_SELF_PROTECTION_INVARIANT");
+        }
+    }
+
+    #[test]
+    fn test_tier0_read_only_self_protection_passes() {
+        let read_targets = vec![
+            ("view_file", json!({ "filepath": "hooks/laya-pretool-hook.js" })),
+            ("read_file", json!({ "path": "laya_config.json" })),
+        ];
+
+        for (tool, args) in read_targets {
+            let res = check_tier0_invariants(tool, &args);
+            assert!(res.is_none(), "Read operations should not trigger self-protection invariant");
+        }
+    }
 }

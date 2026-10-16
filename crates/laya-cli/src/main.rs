@@ -20,6 +20,15 @@ use tower_http::cors::CorsLayer;
 use tracing::Level;
 use tracing_subscriber::FmtSubscriber;
 
+mod paths;
+mod doctor;
+mod install;
+mod init;
+mod policy_cmd;
+mod runner;
+
+use paths::{get_laya_socket_path, resolve_default_paths};
+
 #[derive(Parser, Debug)]
 #[command(name = "laya", author, version, about = "High-Performance Native Laya ONNX Inference Engine & Policy Runtime", long_about = None)]
 struct Cli {
@@ -52,7 +61,62 @@ struct Cli {
 }
 
 #[derive(Subcommand, Debug)]
+pub enum PolicyAction {
+    /// Test project policy against global defaults and Tier 0 invariants
+    Test {
+        /// Path to project directory or policy file
+        #[arg(short, long)]
+        path: Option<PathBuf>,
+    },
+
+    /// Trust the current project's policy.toml to permit custom allow rules
+    Trust {
+        /// Path to project directory or policy file
+        #[arg(short, long)]
+        path: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 enum Commands {
+    /// Check system health, runtime availability, model weights, and detected integrations
+    Doctor,
+
+    /// Globally install Laya CLI, create user config (~/.config/laya), and provision model artifacts
+    Install {
+        /// Optional custom binary install directory (default: ~/.local/bin)
+        #[arg(long)]
+        bin_dir: Option<PathBuf>,
+
+        /// Force re-installation even if already present
+        #[arg(short, long)]
+        force: bool,
+    },
+
+    /// Initialize Laya project policy (.laya/policy.toml) in current directory
+    Init {
+        /// Target workspace directory (default: current directory)
+        #[arg(short, long)]
+        workspace: Option<PathBuf>,
+    },
+
+    /// Policy commands: test monotonicity, trust project rules
+    Policy {
+        #[command(subcommand)]
+        action: PolicyAction,
+    },
+
+    /// Evaluate and execute a shell command through Laya policy enforcement
+    Run {
+        /// Command and arguments to execute
+        #[arg(trailing_var_arg = true, required = true)]
+        command: Vec<String>,
+
+        /// Execute with sandbox / isolation where supported (bubblewrap on Linux)
+        #[arg(long)]
+        isolated: bool,
+    },
+
     /// Inspect ONNX model graph structure, inputs, and outputs
     Inspect {
         /// Path to ONNX model
@@ -99,6 +163,14 @@ enum Commands {
         /// Host address to bind HTTP daemon
         #[arg(long, default_value = "127.0.0.1")]
         host: String,
+
+        /// Unix domain socket path to bind in addition to HTTP
+        #[arg(long, env = "LAYA_SOCKET_PATH")]
+        socket: Option<PathBuf>,
+
+        /// Server-controlled workspace directory root
+        #[arg(long, env = "LAYA_WORKSPACE")]
+        workspace: Option<PathBuf>,
     },
 
     /// Verify cryptographic artifact hashes against supplied model_manifest.json
@@ -113,62 +185,11 @@ enum Commands {
     },
 }
 
-fn resolve_default_paths(
-    cli_model: Option<PathBuf>,
-    cli_tokenizer: Option<PathBuf>,
-    cli_config: Option<PathBuf>,
-    cli_rules: Option<PathBuf>,
-) -> (PathBuf, PathBuf, Option<PathBuf>, Option<PathBuf>) {
-    let repo_root = PathBuf::from(std::env::var("LAYA_HOME").unwrap_or_else(|_| ".".to_string()));
-
-    let model_path = cli_model.unwrap_or_else(|| {
-        let int8 = repo_root.join("laya_int8.onnx");
-        if int8.exists() {
-            int8
-        } else {
-            repo_root.join("laya.onnx")
-        }
-    });
-
-    let tokenizer_path = cli_tokenizer.unwrap_or_else(|| {
-        let candidate = repo_root.join("tokenizer").join("tokenizer.json");
-        if candidate.exists() {
-            candidate
-        } else {
-            repo_root.join("tokenizer.json")
-        }
-    });
-
-    let config_path = cli_config.or_else(|| {
-        let candidate = repo_root.join("laya_config.json");
-        if candidate.exists() {
-            Some(candidate)
-        } else {
-            None
-        }
-    });
-
-    let rules_path = cli_rules.or_else(|| {
-        let candidate = repo_root.join("laya_rules.json");
-        if candidate.exists() {
-            Some(candidate)
-        } else {
-            let alt = repo_root.join(".laya").join("rules.json");
-            if alt.exists() {
-                Some(alt)
-            } else {
-                None
-            }
-        }
-    });
-
-    (model_path, tokenizer_path, config_path, rules_path)
-}
-
 struct AppState {
     engine: Arc<LayaEngine>,
     start_time: Instant,
     model_name: String,
+    server_workspace: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -182,9 +203,42 @@ async fn main() -> Result<()> {
     let _ = tracing::subscriber::set_global_default(subscriber);
 
     let (model_path, tokenizer_path, config_path, rules_path) =
-        resolve_default_paths(cli.model, cli.tokenizer, cli.config, cli.rules);
+        resolve_default_paths(cli.model.clone(), cli.tokenizer.clone(), cli.config.clone(), cli.rules.clone());
 
     match cli.command {
+        Commands::Doctor => {
+            doctor::run_doctor().await?;
+        }
+
+        Commands::Install { bin_dir, force } => {
+            install::run_install(bin_dir, force)?;
+        }
+
+        Commands::Init { workspace } => {
+            init::run_init(workspace)?;
+        }
+
+        Commands::Policy { action } => match action {
+            PolicyAction::Test { path } => {
+                policy_cmd::run_policy_test(path)?;
+            }
+            PolicyAction::Trust { path } => {
+                policy_cmd::run_policy_trust(path)?;
+            }
+        },
+
+        Commands::Run { command, isolated } => {
+            runner::run_command_runner(
+                command,
+                isolated,
+                cli.model,
+                cli.tokenizer,
+                cli.config,
+                cli.rules,
+                cli.threads,
+            )?;
+        }
+
         Commands::Inspect { model } => {
             let target_model = model.unwrap_or(model_path);
             println!("================================================================================");
@@ -222,14 +276,6 @@ async fn main() -> Result<()> {
             context,
             stdin,
         } => {
-            let engine = LayaEngine::load(
-                &model_path,
-                &tokenizer_path,
-                config_path.as_deref(),
-                rules_path.as_deref(),
-                cli.threads,
-            )?;
-
             let req: DecisionRequest = if stdin {
                 let mut buffer = String::new();
                 io::stdin().read_to_string(&mut buffer)?;
@@ -241,15 +287,60 @@ async fn main() -> Result<()> {
                     None => json!({ "command": "git status" }),
                 };
 
-                DecisionRequest {
-                    tool: tool_name,
-                    args: args_val,
-                    context,
-                    criteria: None,
-                }
+                let mut r = DecisionRequest::new(tool_name, args_val);
+                r.context = context;
+                r
             };
 
-            let res = engine.decide(&req)?;
+            let engine = LayaEngine::load(
+                &model_path,
+                &tokenizer_path,
+                config_path.as_deref(),
+                rules_path.as_deref(),
+                cli.threads,
+            )?;
+
+            let target_ws = req.workspace.as_ref()
+                .map(|w| fs::canonicalize(w).unwrap_or_else(|_| PathBuf::from(w)))
+                .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+
+            let mut policy = engine.get_policy_clone();
+            let global_config = crate::paths::get_laya_config_dir();
+            let trust_file = global_config.join("trusted-manifests").join("trusted_projects.json");
+
+            if let Some((content, is_trusted, policy_path)) = crate::policy_cmd::verify_and_read_project_policy(&target_ws, &trust_file) {
+                let is_toml = policy_path.extension().and_then(|s| s.to_str()) == Some("toml");
+                match policy.load_project_override_str(&content, is_toml, is_trusted) {
+                    Ok(warnings) => {
+                        for w in warnings {
+                            eprintln!("[LAYA POLICY WARNING] {}", w);
+                        }
+                    }
+                    Err(err) => {
+                        eprintln!("[LAYA POLICY ERROR] Failed to load project policy '{}': {}", policy_path.display(), err);
+                        let mut prob_map = std::collections::HashMap::new();
+                        prob_map.insert("REQUIRE_AUTHORIZATION".to_string(), 1.0);
+                        let err_res = DecisionResponse {
+                            version: Some("1.0".to_string()),
+                            decision: "REQUIRE_AUTHORIZATION".to_string(),
+                            reasoning: Some(format!("Project policy '{}' failed to load: {}. Escalating to REQUIRE_AUTHORIZATION.", policy_path.display(), err)),
+                            probability: Some(1.0),
+                            probabilities: Some(prob_map),
+                            matched_rule: Some("MALFORMED_PROJECT_POLICY_ESCALATION".to_string()),
+                            risk_category: Some("policy_integrity".to_string()),
+                            enforcement_action: Some("prompt_user".to_string()),
+                            tier: Some("tier_0_hard_invariant".to_string()),
+                            temperature: Some(1.0),
+                            logits: None,
+                            is_error: false,
+                        };
+                        println!("{}", serde_json::to_string_pretty(&err_res)?);
+                        return Ok(());
+                    }
+                }
+            }
+
+            let res = engine.decide_with_policy(&req, &policy, Some(&target_ws))?;
             println!("{}", serde_json::to_string_pretty(&res)?);
         }
 
@@ -290,12 +381,8 @@ async fn main() -> Result<()> {
                     let args = task.get("args").cloned().unwrap_or(json!({}));
                     let context = task.get("context").and_then(|v| v.as_str()).map(|s| s.to_string());
 
-                    let req = DecisionRequest {
-                        tool: tool.to_string(),
-                        args,
-                        context,
-                        criteria: None,
-                    };
+                    let mut req = DecisionRequest::new(tool.to_string(), args);
+                    req.context = context;
 
                     let task_start = Instant::now();
                     let res = engine.decide(&req)?;
@@ -331,12 +418,8 @@ async fn main() -> Result<()> {
                 }
             } else {
                 println!("\n[1/2] Benchmarking Tier 1 Declarative Policy Fast-Path (N={})...", iterations);
-                let fast_req = DecisionRequest {
-                    tool: "laya_run_command".to_string(),
-                    args: json!({ "command": "git status" }),
-                    context: Some("Check repository status for working tree modifications".to_string()),
-                    criteria: None,
-                };
+                let mut fast_req = DecisionRequest::new("laya_run_command", json!({ "command": "git status" }));
+                fast_req.context = Some("Check repository status for working tree modifications".to_string());
                 let _ = engine.decide(&fast_req)?;
 
                 let mut fast_latencies = Vec::with_capacity(iterations);
@@ -365,12 +448,8 @@ async fn main() -> Result<()> {
                 // Neural ONNX inference test
                 let neural_iterations = iterations.min(100);
                 println!("\n[2/2] Benchmarking Tier 2 Neural ONNX Inference (N={})...", neural_iterations);
-                let neural_req = DecisionRequest {
-                    tool: "laya_run_command".to_string(),
-                    args: json!({ "command": "custom_build_binary --target wasm32" }),
-                    context: Some("Compile application for experimental WebAssembly target".to_string()),
-                    criteria: None,
-                };
+                let mut neural_req = DecisionRequest::new("laya_run_command", json!({ "command": "custom_build_binary --target wasm32" }));
+                neural_req.context = Some("Compile application for experimental WebAssembly target".to_string());
                 let _ = engine.decide(&neural_req)?;
 
                 let mut neural_latencies = Vec::with_capacity(neural_iterations);
@@ -399,9 +478,9 @@ async fn main() -> Result<()> {
             println!("================================================================================");
         }
 
-        Commands::Serve { port, host } => {
+        Commands::Serve { port, host, socket, workspace } => {
             println!("================================================================================");
-            println!("⚡ LAYA NATIVE RUST DAEMON (Axum Engine)");
+            println!("⚡ LAYA UNIVERSAL LOCAL POLICY DAEMON (Axum Engine)");
             println!("================================================================================");
             println!("Initializing ONNX Runtime engine (threads: {})...", cli.threads);
 
@@ -415,18 +494,19 @@ async fn main() -> Result<()> {
             )?;
             println!("✓ Model loaded in {:.2}ms ({})", t0.elapsed().as_secs_f64() * 1000.0, model_path.display());
 
+            let server_workspace = workspace.map(|w| fs::canonicalize(&w).unwrap_or(w));
             let app_state = Arc::new(AppState {
                 engine: Arc::new(engine),
                 start_time: Instant::now(),
                 model_name: model_path.file_name().unwrap_or_default().to_string_lossy().to_string(),
+                server_workspace,
             });
 
+            // Restrict CORS strictly to loopback origins; local adapters execute outside browsers.
             let cors = CorsLayer::new()
                 .allow_origin([
-                    "http://localhost:3000".parse().unwrap(),
-                    "http://127.0.0.1:3000".parse().unwrap(),
-                    "http://localhost:8000".parse().unwrap(),
                     "http://127.0.0.1:8000".parse().unwrap(),
+                    "http://localhost:8000".parse().unwrap(),
                 ])
                 .allow_methods([axum::http::Method::GET, axum::http::Method::POST])
                 .allow_headers([axum::http::header::CONTENT_TYPE, axum::http::header::AUTHORIZATION]);
@@ -439,14 +519,75 @@ async fn main() -> Result<()> {
                 .with_state(app_state);
 
             let addr: SocketAddr = format!("{}:{}", host, port).parse()?;
-            println!("\n🚀 Laya Native Daemon listening on http://{}", addr);
-            println!("   - Health Check: http://{}/health", addr);
-            println!("   - Decisions:    POST http://{}/decide", addr);
-            println!("   - Status:       Drop-in replacement for Python FastAPI on :{}", port);
+            let tcp_listener = tokio::net::TcpListener::bind(addr).await?;
+
+            println!("\n🚀 Laya Universal Policy Daemon active:");
+            println!("   - HTTP Health:  http://{}/health", addr);
+            println!("   - HTTP Decide:  POST http://{}/decide", addr);
+
+            #[cfg(unix)]
+            let sock_path = socket.unwrap_or_else(get_laya_socket_path);
+            #[cfg(unix)]
+            if let Some(parent) = sock_path.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            #[cfg(unix)]
+            if sock_path.exists() {
+                if tokio::net::UnixStream::connect(&sock_path).await.is_ok() {
+                    anyhow::bail!("Another active Laya daemon is already listening on socket: {}", sock_path.display());
+                }
+                let _ = fs::remove_file(&sock_path);
+            }
+
+            #[cfg(unix)]
+            println!("   - Unix Socket:  {}", sock_path.display());
             println!("================================================================================");
 
-            let listener = tokio::net::TcpListener::bind(addr).await?;
-            axum::serve(listener, app).await?;
+            let tcp_task = tokio::spawn(async move {
+                let _ = axum::serve(tcp_listener, app).await;
+            });
+
+            #[cfg(unix)]
+            {
+                // Set restrictive umask 0o177 before bind to create socket with 0600 mode atomically.
+                // NOTE: The TCP port (bound to 127.0.0.1) is the actual security boundary because the Unix socket
+                // proxies connections directly to the local TCP listener.
+                let old_umask = unsafe { libc::umask(0o177) };
+                let unix_listener_res = tokio::net::UnixListener::bind(&sock_path);
+                unsafe { libc::umask(old_umask) };
+                let unix_listener = unix_listener_res?;
+
+                let sock_path_clone = sock_path.clone();
+                let unix_task = tokio::spawn(async move {
+                    loop {
+                        match unix_listener.accept().await {
+                            Ok((mut unix_stream, _)) => {
+                                tokio::spawn(async move {
+                                    if let Ok(mut tcp_stream) = tokio::net::TcpStream::connect(addr).await {
+                                        let _ = tokio::io::copy_bidirectional(&mut unix_stream, &mut tcp_stream).await;
+                                    }
+                                });
+                            }
+                            Err(e) => {
+                                eprintln!("[LAYA] Unix socket accept error: {}", e);
+                                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                            }
+                        }
+                    }
+                });
+
+                tokio::select! {
+                    _ = tcp_task => {},
+                    _ = unix_task => {},
+                }
+
+                let _ = fs::remove_file(&sock_path_clone);
+            }
+
+            #[cfg(not(unix))]
+            {
+                let _ = tcp_task.await;
+            }
         }
 
         Commands::VerifyManifest { manifest, trusted_digest } => {
@@ -594,12 +735,66 @@ async fn decide_handler(
     Json(payload): Json<DecisionRequest>,
 ) -> Result<Json<DecisionResponse>, (StatusCode, String)> {
     let engine = state.engine.clone();
-    tokio::task::spawn_blocking(move || engine.decide(&payload))
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Task join error: {}", e)))?
-        .map(Json)
-        .map_err(|err| (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Laya Engine Error: {}", err),
-        ))
+    let server_ws = state.server_workspace.clone();
+    tokio::task::spawn_blocking(move || {
+        // Evaluate the requesting project's policy; trust it only if it matches the server-controlled root (if configured).
+        let req_ws = payload.workspace.as_ref()
+            .map(|w| fs::canonicalize(w).unwrap_or_else(|_| PathBuf::from(w)));
+        let ws = req_ws.or_else(|| server_ws.clone());
+        let mut policy = engine.get_policy_clone();
+
+        if let Some(ref target_ws) = ws {
+            if target_ws.exists() {
+                let global_config = crate::paths::get_laya_config_dir();
+                let trust_file = global_config.join("trusted-manifests").join("trusted_projects.json");
+
+                // Security: verify policy content hash atomically against trust registry before loading.
+                if let Some((content, trusted_by_hash, policy_path)) = crate::policy_cmd::verify_and_read_project_policy(target_ws, &trust_file) {
+                    // Only grant is_trusted if the request workspace matches the server-controlled
+                    // workspace (if configured) AND its hash matches the trust registry.
+                    let is_trusted = match server_ws.as_ref() {
+                        Some(sws) => sws == target_ws && trusted_by_hash,
+                        None => trusted_by_hash,
+                    };
+
+                    let is_toml = policy_path.extension().and_then(|s| s.to_str()) == Some("toml");
+                    match policy.load_project_override_str(&content, is_toml, is_trusted) {
+                        Ok(warnings) => {
+                            for w in warnings {
+                                eprintln!("[LAYA POLICY WARNING] {}", w);
+                            }
+                        }
+                        Err(err) => {
+                            eprintln!("[LAYA POLICY ERROR] Failed to load project policy '{}': {}", policy_path.display(), err);
+                            let mut prob_map = std::collections::HashMap::new();
+                            prob_map.insert("REQUIRE_AUTHORIZATION".to_string(), 1.0);
+                            return Ok(DecisionResponse {
+                                version: Some("1.0".to_string()),
+                                decision: "REQUIRE_AUTHORIZATION".to_string(),
+                                reasoning: Some(format!("Project policy '{}' failed to load: {}. Escalating to prompt_user for safety.", policy_path.display(), err)),
+                                probability: Some(1.0),
+                                probabilities: Some(prob_map),
+                                matched_rule: Some("MALFORMED_PROJECT_POLICY_ESCALATION".to_string()),
+                                risk_category: Some("policy_integrity".to_string()),
+                                enforcement_action: Some("prompt_user".to_string()),
+                                tier: Some("tier_0_hard_invariant".to_string()),
+                                temperature: Some(1.0),
+                                logits: None,
+                                is_error: false,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        engine.decide_with_policy(&payload, &policy, ws.as_deref())
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Task join error: {}", e)))?
+    .map(Json)
+    .map_err(|err| (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        format!("Laya Engine Error: {}", err),
+    ))
 }

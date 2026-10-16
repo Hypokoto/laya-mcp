@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Laya Generic CLI Wrapper — Enforces policy decisions on arbitrary terminal commands
+set -e
+
+if [ $# -eq 0 ]; then
+    echo "Usage: laya-run <command> [args...]"
+    exit 1
+fi
+
+exec laya run -- "$@"

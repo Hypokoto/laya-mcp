@@ -47,33 +47,82 @@ impl PolicyTier {
     }
 }
 
+fn default_protocol_version() -> Option<String> {
+    Some("1.0".to_string())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DecisionRequest {
+    #[serde(default = "default_protocol_version")]
+    pub version: Option<String>,
+
     pub tool: String,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
+
+    /// Tool arguments, supporting both 'arguments' (v1) and 'args' (legacy)
+    #[serde(default, alias = "arguments")]
     pub args: Value,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<String>,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub criteria: Option<HashMap<String, String>>,
 }
 
+impl DecisionRequest {
+    pub fn new(tool: impl Into<String>, args: Value) -> Self {
+        Self {
+            version: Some("1.0".to_string()),
+            tool: tool.into(),
+            operation: None,
+            workspace: None,
+            args,
+            context: None,
+            criteria: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DecisionResponse {
+    #[serde(default = "default_protocol_version")]
+    pub version: Option<String>,
+
     pub decision: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "reason")]
     pub reasoning: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "confidence")]
     pub probability: Option<f32>,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub probabilities: Option<HashMap<String, f32>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "rule_id")]
     pub matched_rule: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub risk_category: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enforcement_action: Option<String>,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tier: Option<String>,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub logits: Option<Vec<f32>>,
+
     #[serde(default)]
     pub is_error: bool,
 }

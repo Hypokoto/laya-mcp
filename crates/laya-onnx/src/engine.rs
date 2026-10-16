@@ -77,7 +77,33 @@ impl LayaEngine {
         self.workspace_root = Some(root.as_ref().to_path_buf());
     }
 
+    pub fn load_project_override<P: AsRef<Path>>(&self, path: P, is_trusted: bool) -> Result<Vec<String>> {
+        let mut policy = self.policy.write().unwrap();
+        policy.load_project_override(path, is_trusted)
+    }
+
+    pub fn get_policy_clone(&self) -> PolicyEngine {
+        self.policy.read().unwrap().clone()
+    }
+
     pub fn decide(&self, req: &DecisionRequest) -> Result<DecisionResponse> {
+        let policy = self.policy.read().unwrap();
+        self.decide_with_policy(req, &policy, None)
+    }
+
+    pub fn decide_with_policy(
+        &self,
+        req: &DecisionRequest,
+        policy: &PolicyEngine,
+        workspace_root: Option<&Path>,
+    ) -> Result<DecisionResponse> {
+        let is_shell_tool = is_shell_execution_tool(&req.tool);
+        let is_file_tool = is_file_mutation_tool(&req.tool);
+
+        let ws = workspace_root
+            .or_else(|| req.workspace.as_ref().map(Path::new))
+            .or(self.workspace_root.as_deref());
+
         // Tier 0: Hard Invariants & Self-Protection (Deterministic, zero ML, non-negotiable)
         if let Some((emergency_verdict, invariant_name)) = check_tier0_invariants(&req.tool, &req.args) {
             if emergency_verdict == "DENY" {
@@ -87,19 +113,21 @@ impl LayaEngine {
                 prob_map.insert("REQUIRE_AUTHORIZATION".to_string(), 0.0);
 
                 return Ok(DecisionResponse {
+                    version: Some("1.0".to_string()),
                     decision: "DENY".to_string(),
                     reasoning: Some("Tier 0 hard security invariant overrule: catastrophic command violation.".to_string()),
                     probability: Some(1.0),
                     probabilities: Some(prob_map),
                     matched_rule: Some(invariant_name.to_string()),
+                    risk_category: Some("system_integrity".to_string()),
+                    enforcement_action: Some("block".to_string()),
                     tier: Some(PolicyTier::Tier0HardInvariant.as_str().to_string()),
                     temperature: Some(1.0),
                     logits: None,
                     is_error: false,
                 });
             } else if emergency_verdict == "REQUIRE_AUTHORIZATION" {
-                let policy = self.policy.read().unwrap();
-                let rule_match = policy.evaluate(&req.tool, &req.args, self.workspace_root.as_deref());
+                let rule_match = policy.evaluate(&req.tool, &req.args, ws);
                 if let Some((rule_action, rule_name)) = rule_match {
                     if rule_action == "DENY" {
                         let mut prob_map = HashMap::new();
@@ -108,11 +136,14 @@ impl LayaEngine {
                         prob_map.insert("REQUIRE_AUTHORIZATION".to_string(), 0.0);
 
                         return Ok(DecisionResponse {
+                            version: Some("1.0".to_string()),
                             decision: "DENY".to_string(),
                             reasoning: Some(format!("Matched declarative policy rule '{}': DENY.", rule_name)),
                             probability: Some(1.0),
                             probabilities: Some(prob_map),
                             matched_rule: Some(rule_name.to_string()),
+                            risk_category: Some(if is_shell_tool { "shell_execution".to_string() } else if is_file_tool { "filesystem_mutation".to_string() } else { "policy_rule".to_string() }),
+                            enforcement_action: Some("block".to_string()),
                             tier: Some(PolicyTier::Tier1DeterministicFastPath.as_str().to_string()),
                             temperature: Some(1.0),
                             logits: None,
@@ -127,11 +158,14 @@ impl LayaEngine {
                 prob_map.insert("REQUIRE_AUTHORIZATION".to_string(), 1.0);
 
                 return Ok(DecisionResponse {
+                    version: Some("1.0".to_string()),
                     decision: "REQUIRE_AUTHORIZATION".to_string(),
                     reasoning: Some("Tier 0 hard invariant overrule: self-protection or sensitive operation invariant violation.".to_string()),
                     probability: Some(1.0),
                     probabilities: Some(prob_map),
                     matched_rule: Some(invariant_name.to_string()),
+                    risk_category: Some("system_integrity".to_string()),
+                    enforcement_action: Some("prompt_user".to_string()),
                     tier: Some(PolicyTier::Tier0HardInvariant.as_str().to_string()),
                     temperature: Some(1.0),
                     logits: None,
@@ -142,20 +176,27 @@ impl LayaEngine {
 
         // Tier 1: Declarative Fast-Path & User Rules Engine
         {
-            let policy = self.policy.read().unwrap();
-            let rule_match = policy.evaluate(&req.tool, &req.args, self.workspace_root.as_deref());
+            let rule_match = policy.evaluate(&req.tool, &req.args, ws);
             if let Some((rule_action, rule_name)) = rule_match {
                 let mut prob_map = HashMap::new();
                 prob_map.insert("ALLOW".to_string(), if rule_action == "ALLOW" { 1.0 } else { 0.0 });
                 prob_map.insert("DENY".to_string(), if rule_action == "DENY" { 1.0 } else { 0.0 });
                 prob_map.insert("REQUIRE_AUTHORIZATION".to_string(), if rule_action == "REQUIRE_AUTHORIZATION" { 1.0 } else { 0.0 });
 
+                let enforcement = match rule_action {
+                    "ALLOW" => "execute",
+                    "DENY" => "block",
+                    _ => "prompt_user",
+                };
                 return Ok(DecisionResponse {
+                    version: Some("1.0".to_string()),
                     decision: rule_action.to_string(),
                     reasoning: Some(format!("Matched declarative policy rule '{}': {}.", rule_name, rule_action)),
                     probability: Some(1.0),
                     probabilities: Some(prob_map),
                     matched_rule: Some(rule_name.to_string()),
+                    risk_category: Some(if is_shell_tool { "shell_execution".to_string() } else if is_file_tool { "filesystem_mutation".to_string() } else { "policy_rule".to_string() }),
+                    enforcement_action: Some(enforcement.to_string()),
                     tier: Some(PolicyTier::Tier1DeterministicFastPath.as_str().to_string()),
                     temperature: Some(1.0),
                     logits: None,
@@ -192,11 +233,14 @@ impl LayaEngine {
                 prob_map.insert(k.clone(), if k == "REQUIRE_AUTHORIZATION" { 1.0 } else { 0.0 });
             }
             return Ok(DecisionResponse {
+                version: Some("1.0".to_string()),
                 decision: "REQUIRE_AUTHORIZATION".to_string(),
                 reasoning: Some("Input payload exceeds 512 token context budget; truncated payloads require human authorization.".to_string()),
                 probability: Some(1.0),
                 probabilities: Some(prob_map),
                 matched_rule: Some("TRUNCATION_ESCALATION".to_string()),
+                risk_category: Some(if is_shell_tool { "shell_execution".to_string() } else if is_file_tool { "filesystem_mutation".to_string() } else { "payload_truncation".to_string() }),
+                enforcement_action: Some("prompt_user".to_string()),
                 tier: Some(PolicyTier::Tier2NeuralRiskAssessment.as_str().to_string()),
                 temperature: Some(1.0),
                 logits: None,
@@ -312,12 +356,28 @@ impl LayaEngine {
             );
         }
 
+        let enforcement = match decision.as_str() {
+            "ALLOW" => "execute",
+            "DENY" => "block",
+            _ => "prompt_user",
+        };
+        let risk_cat = if is_shell_tool {
+            "shell_execution"
+        } else if is_file_tool {
+            "filesystem_mutation"
+        } else {
+            "neural_evaluation"
+        };
+
         Ok(DecisionResponse {
+            version: Some("1.0".to_string()),
             decision,
             reasoning: Some(reasoning),
             probability: Some(best_prob),
             probabilities: Some(prob_map),
             matched_rule: None,
+            risk_category: Some(risk_cat.to_string()),
+            enforcement_action: Some(enforcement.to_string()),
             tier: Some(PolicyTier::Tier2NeuralRiskAssessment.as_str().to_string()),
             temperature: Some(t),
             logits: Some(logits_slice.to_vec()),

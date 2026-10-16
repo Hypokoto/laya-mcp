@@ -631,18 +631,33 @@ async fn main() -> Result<()> {
                     }
                 });
 
+                let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+
                 tokio::select! {
                     _ = tcp_task => {},
                     _ = unix_task => {},
+                    _ = tokio::signal::ctrl_c() => {
+                        println!("\n[LAYA] Received SIGINT (Ctrl+C), cleaning up IPC socket and token...");
+                    },
+                    _ = sigterm.recv() => {
+                        println!("\n[LAYA] Received SIGTERM, cleaning up IPC socket and token...");
+                    },
                 }
 
                 let _ = fs::remove_file(&sock_path_clone);
                 let _ = fs::remove_file(paths::get_laya_auth_token_path());
+                println!("✓ Socket and session auth token unlinked successfully.");
             }
 
             #[cfg(not(unix))]
             {
-                let _ = tcp_task.await;
+                tokio::select! {
+                    _ = tcp_task => {},
+                    _ = tokio::signal::ctrl_c() => {
+                        println!("\n[LAYA] Received SIGINT (Ctrl+C), cleaning up...");
+                    },
+                }
+                let _ = fs::remove_file(paths::get_laya_auth_token_path());
             }
         }
 

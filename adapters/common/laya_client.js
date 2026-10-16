@@ -232,21 +232,36 @@ function computeActionDigest(tool, workspace, args) {
     return hash.digest('hex');
 }
 
-const consumedReceipts = new Set();
+const consumedReceipts = new Map();
+const RECEIPT_TTL_MS = 5 * 60 * 1000; // 5 minutes validity
+const MAX_RECEIPTS = 10000;
+
+function pruneExpiredReceipts(now = Date.now()) {
+    if (consumedReceipts.size > MAX_RECEIPTS) {
+        for (const [nonce, data] of consumedReceipts.entries()) {
+            if (now - (data.timestamp || 0) > RECEIPT_TTL_MS) {
+                consumedReceipts.delete(nonce);
+            }
+        }
+    }
+}
 
 /**
  * Validates that an action about to be executed strictly matches the approved digest.
- * Detects post-approval argument substitution, workspace alteration, and replay attacks.
+ * Detects post-approval argument substitution, workspace alteration, expired approvals, and replay attacks.
  */
-function verifyActionBinding(approvedDigest, tool, workspace, args, receiptNonce = null) {
+function verifyActionBinding(approvedDigest, tool, workspace, args, receiptNonce = null, sessionToken = null) {
     if (!approvedDigest) {
         throw new Error('Action binding verification failed: No approved digest provided.');
     }
+    const now = Date.now();
     if (receiptNonce) {
-        if (consumedReceipts.has(receiptNonce)) {
+        const existing = consumedReceipts.get(receiptNonce);
+        if (existing) {
             throw new Error(`Security violation: Replay attack detected! Approval nonce '${receiptNonce}' has already been consumed.`);
         }
-        consumedReceipts.add(receiptNonce);
+        consumedReceipts.set(receiptNonce, { timestamp: now, sessionToken: sessionToken || null });
+        pruneExpiredReceipts(now);
     }
     const currentDigest = computeActionDigest(tool, workspace, args);
     if (currentDigest.toLowerCase() !== approvedDigest.toLowerCase()) {

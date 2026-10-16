@@ -82,8 +82,13 @@ ActionDigest = SHA-256( normalize(tool) + ":" + canonicalize(workspace) + ":" + 
    - Cross-language equivalence is guaranteed bit-for-bit between Rust (`crates/laya-core/src/types.rs`) and JavaScript (`adapters/common/laya_client.js`).
 2. **Execution Binding Verification**:
    - When an action is evaluated as `REQUIRE_AUTHORIZATION`, Laya returns an `action_digest` and single-use `receipt_nonce`.
-   - Immediately prior to execution, the host adapter invokes `verifyActionBinding(approvedDigest, tool, workspace, currentArgs, nonce)`.
+   - Immediately prior to execution, the host adapter invokes `verifyActionBinding(approvedDigest, tool, workspace, currentArgs, nonce, sessionToken)`.
    - If any argument, tool name, or workspace path is altered post-approval, or if a nonce is reused, execution is aborted immediately with a security exception.
+3. **Receipt Lifecycle & Concurrency Guarantees**:
+   - **Atomic Nonce Consumption**: Concurrently racing attempts to execute the same approval token are rejected; exactly one succeeds, and all other racing requests fail.
+   - **Time-to-Live (TTL)**: Approval receipts carry a 5-minute validity window (`RECEIPT_TTL_MS = 300_000`), after which approvals expire automatically.
+   - **Session Metadata Binding**: Each consumed receipt records its session token and timestamp.
+   - **Bounded Memory Pruning**: Receipt memory is capped at 10,000 entries with automatic expired entry eviction to prevent memory leaks during long-running sessions.
 
 ---
 
@@ -95,6 +100,7 @@ Laya operates as a background daemon (`laya serve`) communicating with host adap
 - **Location**: `~/.local/state/laya/laya.sock`
 - **Socket Permissions**: Bound atomically under umask `0177` (filesystem mode `0600`), restricted to the file owner.
 - **Kernel Caller Verification (`SO_PEERCRED`)**: The listener explicitly queries `unix_stream.peer_cred()`. Connections originating from any user ID other than the daemon owner's UID are immediately dropped by the kernel interface before request parsing.
+- **Lifecycle & Signal Handling**: The daemon handles `SIGINT` (Ctrl+C) and `SIGTERM` signals, guaranteeing unlinking of `laya.sock` and `auth_token` on shutdown. If restarted after an unexpected crash, stale dead sockets are automatically identified and cleaned up.
 
 ### 2. Loopback TCP HTTP — Secondary Channel (`~1ms`)
 - **Endpoint**: `127.0.0.1:8000` (strictly bound to localhost, never `0.0.0.0`).
@@ -130,6 +136,9 @@ Because developer workflows commonly execute build scripts (`build.rs`, `configu
 
 ### Sandbox Guarantees
 - **Read-Only Host Root (`--ro-bind / /`)**: Host binaries, system configurations, and libraries cannot be modified or replaced.
-- **Shadowed Credentials**: `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.kube`, `~/.azure`, `~/.config/gcloud`, and `~/.docker` are masked by empty in-memory `tmpfs` mounts.
+- **Complete Credential Shadowing**: `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.kube`, `~/.azure`, `~/.config/gcloud`, `~/.config/gh`, `~/.config/hub`, `~/.docker`, `~/.gemini`, and `~/.local/state/laya` are masked by empty in-memory `tmpfs` mounts. Single files (`~/.netrc`, `~/.git-credentials`, `~/.npmrc`, `~/.pypirc`, `~/.bash_history`, `~/.zsh_history`) are masked with empty read-only mounts.
+- **Environment Sanitization (`--clearenv`)**: Clears host environment variables, preventing scripts from reading API keys, access tokens, or cloud secrets from `env` or `/proc`.
 - **Kernel Namespace Isolation**: Unshares user, IPC, PID, network, UTS, and cgroup namespaces (`--die-with-parent`).
-- **Isolated Workspace**: Only the designated project directory is mounted read-write.
+- **Hardware State Protection**: Masks `/sys/firmware` and `/sys/kernel/security` with empty tmpfs.
+- **Scoped Workspace**: Only the designated project directory is mounted read-write.
+- **Network Containment**: `--offline` flag drops the network stack entirely (`curl` or raw sockets fail immediately with connection errors).

@@ -9,11 +9,15 @@
 # execute arbitrary code via build scripts (build.rs, package.json scripts) or
 # child subshells once a tool is launched. This harness guarantees:
 #
-# 1. Read-only host filesystem: Host binaries and libraries are mounted read-only.
-# 2. Credential masking: ~/.ssh, ~/.aws, ~/.gnupg, ~/.kube are shadowed by empty tmpfs.
-# 3. Process isolation: Isolated PID/IPC namespace prevents inspecting/signaling host tasks.
-# 4. Scoped workspace: Only the current project workspace is writable.
-# 5. Network containment: Optional --offline flag completely unshares the network stack.
+# 1. Read-only host filesystem: Host root and binaries are mounted read-only.
+# 2. Complete Credential Shadowing: All cloud, git, shell, and daemon credentials
+#    (~/.ssh, ~/.aws, ~/.gemini, ~/.local/state/laya, ~/.netrc) are masked.
+# 3. Environment Sanitization: Clears host environment (--clearenv), stripping
+#    all API keys, tokens, and secrets from being read via env or /proc.
+# 4. Process Isolation: Unshared PID/IPC namespaces hide all host processes.
+# 5. Kernel Security Protection: Masks /sys/firmware and /sys/kernel/security.
+# 6. Scoped Workspace: Only the designated workspace is mounted read-write.
+# 7. Network Containment: Optional --offline flag completely unshares the network.
 # ==============================================================================
 
 set -euo pipefail
@@ -69,7 +73,10 @@ if [[ ${#COMMAND[@]} -eq 0 ]]; then
 fi
 
 if command -v bwrap >/dev/null 2>&1; then
-    # Preferred: Fast, zero-root, unprivileged Bubblewrap sandbox
+    EMPTY_MASK=$(mktemp /tmp/laya_mask.XXXXXX)
+    chmod 0400 "$EMPTY_MASK"
+    trap 'rm -f "$EMPTY_MASK"' EXIT
+
     BWRAP_ARGS=(
         --ro-bind / /
         --dev /dev
@@ -83,17 +90,48 @@ if command -v bwrap >/dev/null 2>&1; then
         --unshare-pid
         --unshare-uts
         --unshare-cgroup
+        --hostname "laya-sandbox"
         --die-with-parent
     )
 
+    # Environment sanitization: clear all host secrets, pass only safe execution vars
+    BWRAP_ARGS+=(
+        --clearenv
+        --setenv PATH "$PATH"
+        --setenv HOME "$HOME"
+        --setenv USER "$USER"
+        --setenv LANG "${LANG:-C.UTF-8}"
+        --setenv TERM "${TERM:-xterm-256color}"
+        --setenv PWD "$WORKSPACE"
+    )
+
+    if [[ -n "${SHELL:-}" ]]; then
+        BWRAP_ARGS+=(--setenv SHELL "$SHELL")
+    fi
+
+    # Network isolation
     if [[ "$OFFLINE" -eq 1 ]]; then
         BWRAP_ARGS+=(--unshare-net)
     fi
 
-    # Mask sensitive credentials
-    for cred_dir in ~/.ssh ~/.aws ~/.gnupg ~/.kube ~/.azure ~/.config/gcloud ~/.docker; do
+    # Shadow sensitive hardware & kernel state
+    for sys_dir in /sys/firmware /sys/kernel/security; do
+        if [[ -d "$sys_dir" ]]; then
+            BWRAP_ARGS+=(--tmpfs "$sys_dir")
+        fi
+    done
+
+    # Shadow sensitive credential & daemon directories with empty tmpfs
+    for cred_dir in ~/.ssh ~/.aws ~/.gnupg ~/.kube ~/.azure ~/.config/gcloud ~/.config/gh ~/.config/hub ~/.docker ~/.gemini ~/.local/state/laya; do
         if [[ -e "$cred_dir" ]]; then
             BWRAP_ARGS+=(--tmpfs "$cred_dir")
+        fi
+    done
+
+    # Shadow single credential files by binding the empty mask file over them
+    for cred_file in ~/.netrc ~/.git-credentials ~/.npmrc ~/.pypirc ~/.bash_history ~/.zsh_history; do
+        if [[ -f "$cred_file" ]]; then
+            BWRAP_ARGS+=(--ro-bind "$EMPTY_MASK" "$cred_file")
         fi
     done
 

@@ -844,6 +844,39 @@ commandPattern = ".*"
                 verifyActionBinding(approvedDigest, approvedTool, approvedWs, approvedArgs, replayNonce);
             }, /Security violation: Replay attack detected! Approval nonce 'nonce-single-use-999' has already been consumed/);
         });
+
+        it('Enforces atomic rejection under concurrent nonce consumption races', () => {
+            const raceNonce = 'nonce-race-concurrent-101';
+            const attempts = Array.from({ length: 10 });
+            let successes = 0;
+            let replayFailures = 0;
+
+            for (const _ of attempts) {
+                try {
+                    verifyActionBinding(approvedDigest, approvedTool, approvedWs, approvedArgs, raceNonce, 'sess-tok-123');
+                    successes++;
+                } catch (err: any) {
+                    if (err.message.includes('Replay attack detected')) {
+                        replayFailures++;
+                    } else {
+                        throw err;
+                    }
+                }
+            }
+
+            assert.strictEqual(successes, 1, 'Exactly one attempt must succeed on single-use nonce');
+            assert.strictEqual(replayFailures, 9, 'All duplicate attempts must be rejected with replay error');
+        });
+
+        it('Attaches session token metadata to consumed receipt entry', () => {
+            const sessionNonce = 'nonce-session-test-202';
+            const sessionToken = 'session-token-alpha-beta';
+            verifyActionBinding(approvedDigest, approvedTool, approvedWs, approvedArgs, sessionNonce, sessionToken);
+            const entry = (consumedReceipts as any).get(sessionNonce);
+            assert.ok(entry, 'Receipt entry must exist in consumedReceipts Map');
+            assert.strictEqual(entry.sessionToken, sessionToken, 'Session token must be recorded');
+            assert.ok(typeof entry.timestamp === 'number', 'Timestamp must be recorded');
+        });
     });
 
     describe('10. Failure Injection & Malformed Payload Defense', () => {
@@ -954,6 +987,56 @@ commandPattern = ".*"
             });
 
             assert.strictEqual(statusCode, 401, 'Empty Bearer token must return HTTP 401');
+        });
+    });
+
+    describe('11. Bubblewrap OS Sandbox Containment Suite', () => {
+        const sandboxScript = path.resolve(__dirname, '../scripts/laya-sandbox.sh');
+
+        it('Enforces read-only host root filesystem: writing to /etc fails', () => {
+            const res = spawnSync(sandboxScript, ['--', 'touch', '/etc/sandbox_tamper_test'], {
+                encoding: 'utf8',
+            });
+            assert.notStrictEqual(res.status, 0, 'Writing to /etc in sandbox must fail');
+            assert.match(res.stderr, /Read-only file system/);
+        });
+
+        it('Shadows sensitive credentials: ~/.ssh and ~/.local/state/laya are empty tmpfs', () => {
+            const res = spawnSync(sandboxScript, ['--', 'ls', '-A', path.join(os.homedir(), '.local', 'state', 'laya')], {
+                encoding: 'utf8',
+            });
+            assert.strictEqual(res.status, 0);
+            assert.strictEqual(res.stdout.trim(), '', 'Sandbox ~/.local/state/laya must be empty');
+        });
+
+        it('Strips host environment secrets: custom secret environment variables are cleared', () => {
+            const res = spawnSync(sandboxScript, ['--', 'env'], {
+                encoding: 'utf8',
+                env: {
+                    ...process.env,
+                    AWS_SECRET_ACCESS_KEY: 'leaked_secret_key_12345',
+                    GITHUB_TOKEN: 'ghp_secret_token_abcdef',
+                },
+            });
+            assert.strictEqual(res.status, 0);
+            assert.strictEqual(res.stdout.includes('leaked_secret_key_12345'), false, 'AWS_SECRET_ACCESS_KEY must be scrubbed');
+            assert.strictEqual(res.stdout.includes('ghp_secret_token_abcdef'), false, 'GITHUB_TOKEN must be scrubbed');
+        });
+
+        it('Isolates process table: host processes are hidden from sandbox /proc', () => {
+            const res = spawnSync(sandboxScript, ['--', 'ps', 'aux'], {
+                encoding: 'utf8',
+            });
+            assert.strictEqual(res.status, 0);
+            const lines = res.stdout.trim().split('\n').filter(Boolean);
+            assert.ok(lines.length <= 4, `Process table must be isolated (saw ${lines.length} processes)`);
+        });
+
+        it('Unshares network stack: --offline blocks outbound network access', () => {
+            const res = spawnSync(sandboxScript, ['--offline', '--', 'curl', '-m', '2', 'https://1.1.1.1'], {
+                encoding: 'utf8',
+            });
+            assert.notStrictEqual(res.status, 0, 'Outbound network connection must fail in offline sandbox');
         });
     });
 });

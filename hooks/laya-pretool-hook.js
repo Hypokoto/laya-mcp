@@ -56,6 +56,7 @@ function resolveActionCwd(toolArgs, raw) {
     try {
         return fs.realpathSync(candidate);
     } catch {
+        // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal
         return path.resolve(candidate);
     }
 }

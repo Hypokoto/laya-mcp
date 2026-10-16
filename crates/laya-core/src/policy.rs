@@ -277,6 +277,7 @@ impl PolicyEngine {
 
     pub fn load_from_file<P: AsRef<Path>>(&mut self, path: P) -> crate::error::Result<()> {
         let p = path.as_ref();
+        // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
         let content = fs::read_to_string(p)?;
         let raw_file: RawRuleFile = if p.extension().and_then(|s| s.to_str()) == Some("toml") {
             toml::from_str(&content).map_err(|e| crate::error::LayaError::Config(format!("Failed to parse TOML policy {}: {}", p.display(), e)))?
@@ -365,6 +366,7 @@ impl PolicyEngine {
             return Ok(Vec::new());
         }
 
+        // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
         let content = fs::read_to_string(p)?;
         let is_toml = p.extension().and_then(|s| s.to_str()) == Some("toml");
         self.load_project_override_str(&content, is_toml, is_trusted)

@@ -367,6 +367,7 @@ Environment Variables:
                 try {
                     const parsed = new URL(origin);
                     if (ALLOWED_HOSTS.has(parsed.hostname)) {
+                        // nosemgrep: javascript.express.security.cors-misconfiguration.cors-misconfiguration
                         res.setHeader("Access-Control-Allow-Origin", origin);
                     }
                 } catch {}

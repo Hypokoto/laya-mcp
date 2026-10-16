@@ -3,7 +3,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashSet;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 static PROTECTED_PATHS_RE: OnceLock<Regex> = OnceLock::new();
@@ -264,14 +264,44 @@ impl PolicyEngine {
         let mut is_path_traversal = false;
 
         if !raw_fp.is_empty() {
+            let clean = raw_fp.replace('\0', "");
+            let path_obj = Path::new(&clean);
             if let Some(ws) = workspace_root {
-                let clean = raw_fp.replace('\0', "");
-                let target = ws.join(clean);
-                if let Ok(rel) = target.strip_prefix(ws) {
-                    canonical_rel_path = rel.to_string_lossy().replace('\\', "/");
-                } else if target.to_string_lossy().contains("..") {
+                let norm_ws = normalize_path(ws);
+                let target = if path_obj.is_absolute() {
+                    normalize_path(path_obj)
+                } else {
+                    normalize_path(&norm_ws.join(path_obj))
+                };
+
+                // Check lexical containment against workspace
+                if let Ok(rel) = target.strip_prefix(&norm_ws) {
+                    // Check symlink escapes on existing path or nearest existing ancestor
+                    let real_ws = fs::canonicalize(&norm_ws).unwrap_or_else(|_| norm_ws.clone());
+                    let mut curr = target.clone();
+                    while !curr.exists() {
+                        match curr.parent() {
+                            Some(parent) if parent != curr => curr = parent.to_path_buf(),
+                            _ => break,
+                        }
+                    }
+
+                    if curr.exists() {
+                        if let Ok(real_ancestor) = fs::canonicalize(&curr) {
+                            if real_ancestor.strip_prefix(&real_ws).is_err() {
+                                is_path_traversal = true;
+                            }
+                        }
+                    }
+
+                    if !is_path_traversal {
+                        canonical_rel_path = rel.to_string_lossy().replace('\\', "/");
+                    }
+                } else {
                     is_path_traversal = true;
                 }
+            } else if path_obj.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+                is_path_traversal = true;
             }
         }
 
@@ -313,4 +343,23 @@ impl PolicyEngine {
 
         None
     }
+}
+
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Prefix(..) | std::path::Component::RootDir => {
+                normalized.push(component);
+            }
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            std::path::Component::Normal(c) => {
+                normalized.push(c);
+            }
+        }
+    }
+    normalized
 }

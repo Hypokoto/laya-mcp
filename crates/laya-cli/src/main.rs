@@ -225,9 +225,10 @@ async fn main() -> Result<()> {
                 serde_json::from_str(&buffer).context("Failed to parse DecisionRequest from stdin")?
             } else {
                 let tool_name = tool.unwrap_or_else(|| "laya_run_command".to_string());
-                let args_val: Value = args
-                    .and_then(|a| serde_json::from_str(&a).ok())
-                    .unwrap_or_else(|| json!({ "command": "git status" }));
+                let args_val: Value = match args {
+                    Some(a) => serde_json::from_str(&a).context("Failed to parse --args JSON")?,
+                    None => json!({ "command": "git status" }),
+                };
 
                 DecisionRequest {
                     tool: tool_name,
@@ -299,19 +300,24 @@ async fn main() -> Result<()> {
                 }
                 println!("\n");
 
-                latencies.sort_by(|a, b| a.partial_cmp(b).unwrap());
-                let total_time = suite_start.elapsed().as_secs_f64();
-                let avg = latencies.iter().sum::<f64>() / latencies.len() as f64;
-                let p50 = latencies[latencies.len() / 2];
-                let p95 = latencies[(latencies.len() as f64 * 0.95) as usize];
+                if latencies.is_empty() {
+                    println!("Suite Results: No tasks evaluated.");
+                } else {
+                    latencies.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    let len = latencies.len();
+                    let total_time = suite_start.elapsed().as_secs_f64();
+                    let avg = latencies.iter().sum::<f64>() / len as f64;
+                    let p50 = latencies[len / 2];
+                    let p95 = latencies[((len as f64 * 0.95) as usize).min(len - 1)];
 
-                println!("Suite Results:");
-                println!("  Total Time:    {:.2}s", total_time);
-                println!("  Avg Latency:   {:.2}ms / query", avg);
-                println!("  p50 Latency:   {:.2}ms", p50);
-                println!("  p95 Latency:   {:.2}ms", p95);
-                println!("  Throughput:    {:.1} req/sec", tasks.len() as f64 / total_time);
-                println!("  Decisions:     {:?}", decisions_count);
+                    println!("Suite Results:");
+                    println!("  Total Time:    {:.2}s", total_time);
+                    println!("  Avg Latency:   {:.2}ms / query", avg);
+                    println!("  p50 Latency:   {:.2}ms", p50);
+                    println!("  p95 Latency:   {:.2}ms", p95);
+                    println!("  Throughput:    {:.1} req/sec", tasks.len() as f64 / total_time.max(1e-4));
+                    println!("  Decisions:     {:?}", decisions_count);
+                }
             } else {
                 println!("\n[1/2] Benchmarking Tier 1 Declarative Policy Fast-Path (N={})...", iterations);
                 let fast_req = DecisionRequest {
@@ -329,16 +335,21 @@ async fn main() -> Result<()> {
                     fast_latencies.push(start.elapsed().as_secs_f64() * 1000.0);
                 }
 
-                fast_latencies.sort_by(|a, b| a.partial_cmp(b).unwrap());
-                let fast_avg: f64 = fast_latencies.iter().sum::<f64>() / iterations as f64;
-                let fast_p50 = fast_latencies[iterations / 2];
-                let fast_p95 = fast_latencies[(iterations as f64 * 0.95) as usize];
+                if fast_latencies.is_empty() {
+                    println!("  Declarative Fast-Path: No iterations performed.");
+                } else {
+                    fast_latencies.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    let len = fast_latencies.len();
+                    let fast_avg: f64 = fast_latencies.iter().sum::<f64>() / len as f64;
+                    let fast_p50 = fast_latencies[len / 2];
+                    let fast_p95 = fast_latencies[((len as f64 * 0.95) as usize).min(len - 1)];
 
-                println!("  Declarative Fast-Path:");
-                println!("    Avg Latency:   {:.3}ms", fast_avg);
-                println!("    p50 (Median):  {:.3}ms", fast_p50);
-                println!("    p95 Latency:   {:.3}ms", fast_p95);
-                println!("    Throughput:    {:.1} ops/sec", 1000.0 / fast_avg);
+                    println!("  Declarative Fast-Path:");
+                    println!("    Avg Latency:   {:.3}ms", fast_avg);
+                    println!("    p50 (Median):  {:.3}ms", fast_p50);
+                    println!("    p95 Latency:   {:.3}ms", fast_p95);
+                    println!("    Throughput:    {:.1} ops/sec", 1000.0 / fast_avg.max(1e-6));
+                }
 
                 // Neural ONNX inference test
                 let neural_iterations = iterations.min(100);
@@ -358,16 +369,21 @@ async fn main() -> Result<()> {
                     neural_latencies.push(start.elapsed().as_secs_f64() * 1000.0);
                 }
 
-                neural_latencies.sort_by(|a, b| a.partial_cmp(b).unwrap());
-                let neural_avg: f64 = neural_latencies.iter().sum::<f64>() / neural_iterations as f64;
-                let neural_p50 = neural_latencies[neural_iterations / 2];
-                let neural_p95 = neural_latencies[(neural_iterations as f64 * 0.95) as usize];
+                if neural_latencies.is_empty() {
+                    println!("  Neural ONNX Inference: No iterations performed.");
+                } else {
+                    neural_latencies.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    let len = neural_latencies.len();
+                    let neural_avg: f64 = neural_latencies.iter().sum::<f64>() / len as f64;
+                    let neural_p50 = neural_latencies[len / 2];
+                    let neural_p95 = neural_latencies[((len as f64 * 0.95) as usize).min(len - 1)];
 
-                println!("  Neural ONNX Inference:");
-                println!("    Avg Latency:   {:.2}ms", neural_avg);
-                println!("    p50 (Median):  {:.2}ms", neural_p50);
-                println!("    p95 Latency:   {:.2}ms", neural_p95);
-                println!("    Throughput:    {:.1} inferences/sec", 1000.0 / neural_avg);
+                    println!("  Neural ONNX Inference:");
+                    println!("    Avg Latency:   {:.2}ms", neural_avg);
+                    println!("    p50 (Median):  {:.2}ms", neural_p50);
+                    println!("    p95 Latency:   {:.2}ms", neural_p95);
+                    println!("    Throughput:    {:.1} inferences/sec", 1000.0 / neural_avg.max(1e-6));
+                }
             }
             println!("================================================================================");
         }
@@ -394,11 +410,21 @@ async fn main() -> Result<()> {
                 model_name: model_path.file_name().unwrap_or_default().to_string_lossy().to_string(),
             });
 
+            let cors = CorsLayer::new()
+                .allow_origin([
+                    "http://localhost:3000".parse().unwrap(),
+                    "http://127.0.0.1:3000".parse().unwrap(),
+                    "http://localhost:8000".parse().unwrap(),
+                    "http://127.0.0.1:8000".parse().unwrap(),
+                ])
+                .allow_methods([axum::http::Method::GET, axum::http::Method::POST])
+                .allow_headers([axum::http::header::CONTENT_TYPE, axum::http::header::AUTHORIZATION]);
+
             let app = Router::new()
                 .route("/health", get(health_handler))
                 .route("/openapi.json", get(openapi_handler))
                 .route("/decide", post(decide_handler))
-                .layer(CorsLayer::permissive())
+                .layer(cors)
                 .with_state(app_state);
 
             let addr: SocketAddr = format!("{}:{}", host, port).parse()?;

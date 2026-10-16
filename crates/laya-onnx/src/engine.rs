@@ -44,7 +44,7 @@ impl LayaEngine {
         let mut policy = PolicyEngine::new();
         if let Some(rp) = rules_path {
             if rp.exists() {
-                let _ = policy.load_from_file(rp);
+                policy.load_from_file(rp)?;
             }
         }
 

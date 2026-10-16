@@ -104,6 +104,8 @@ impl LayaEngine {
             .or_else(|| req.workspace.as_ref().map(Path::new))
             .or(self.workspace_root.as_deref());
 
+        let action_digest = req.compute_action_digest(ws);
+
         // Tier 0: Hard Invariants & Self-Protection (Deterministic, zero ML, non-negotiable)
         if let Some((emergency_verdict, invariant_name)) = check_tier0_invariants(&req.tool, &req.args) {
             if emergency_verdict == "DENY" {
@@ -124,6 +126,8 @@ impl LayaEngine {
                     tier: Some(PolicyTier::Tier0HardInvariant.as_str().to_string()),
                     temperature: Some(1.0),
                     logits: None,
+                    approval_required: false,
+                    action_digest: Some(action_digest),
                     is_error: false,
                 });
             } else if emergency_verdict == "REQUIRE_AUTHORIZATION" {
@@ -147,6 +151,8 @@ impl LayaEngine {
                             tier: Some(PolicyTier::Tier1DeterministicFastPath.as_str().to_string()),
                             temperature: Some(1.0),
                             logits: None,
+                            approval_required: false,
+                            action_digest: Some(action_digest),
                             is_error: false,
                         });
                     }
@@ -169,6 +175,8 @@ impl LayaEngine {
                     tier: Some(PolicyTier::Tier0HardInvariant.as_str().to_string()),
                     temperature: Some(1.0),
                     logits: None,
+                    approval_required: true,
+                    action_digest: Some(action_digest),
                     is_error: false,
                 });
             }
@@ -200,6 +208,8 @@ impl LayaEngine {
                     tier: Some(PolicyTier::Tier1DeterministicFastPath.as_str().to_string()),
                     temperature: Some(1.0),
                     logits: None,
+                    approval_required: rule_action == "REQUIRE_AUTHORIZATION",
+                    action_digest: Some(action_digest.clone()),
                     is_error: false,
                 });
             }
@@ -216,7 +226,7 @@ impl LayaEngine {
         let instruction = req.context.as_deref().unwrap_or(&dynamic_context);
         let qtype = QType::Choice;
 
-        let seq = build_sequence(
+        let seq = match build_sequence(
             &self.tokenizer,
             &req.args,
             qtype,
@@ -224,7 +234,12 @@ impl LayaEngine {
             criteria,
             self.config.max_len,
             self.config.head_max_len,
-        )?;
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                return Ok(self.fallback_domain_decision(req, ws, &format!("Tokenization sequence error: {}", e)));
+            }
+        };
 
         // Guardrail: if truncated, escalate to human authorization
         if seq.is_truncated && criteria.contains_key("REQUIRE_AUTHORIZATION") {
@@ -244,6 +259,8 @@ impl LayaEngine {
                 tier: Some(PolicyTier::Tier2NeuralRiskAssessment.as_str().to_string()),
                 temperature: Some(1.0),
                 logits: None,
+                approval_required: true,
+                action_digest: Some(action_digest.clone()),
                 is_error: false,
             });
         }
@@ -264,14 +281,18 @@ impl LayaEngine {
 
         let start_time = std::time::Instant::now();
         let mut session = self.session.lock().map_err(|e| LayaError::Internal(e.to_string()))?;
-        let outputs = session.run(ort::inputs![
+        let outputs = match session.run(ort::inputs![
             "input_ids" => input_ids_tensor,
             "attention_mask" => attention_mask_tensor,
             "marker_pos" => marker_pos_tensor,
             "marker_mask" => marker_mask_tensor,
             "qtype" => qtype_tensor,
-        ])
-        .map_err(|e| LayaError::Onnx(format!("Inference run error: {}", e)))?;
+        ]) {
+            Ok(o) => o,
+            Err(e) => {
+                return Ok(self.fallback_domain_decision(req, ws, &format!("Inference execution error: {}", e)));
+            }
+        };
 
         let elapsed = start_time.elapsed();
 
@@ -371,7 +392,7 @@ impl LayaEngine {
 
         Ok(DecisionResponse {
             version: Some("1.0".to_string()),
-            decision,
+            decision: decision.clone(),
             reasoning: Some(reasoning),
             probability: Some(best_prob),
             probabilities: Some(prob_map),
@@ -381,8 +402,70 @@ impl LayaEngine {
             tier: Some(PolicyTier::Tier2NeuralRiskAssessment.as_str().to_string()),
             temperature: Some(t),
             logits: Some(logits_slice.to_vec()),
+            approval_required: decision == "REQUIRE_AUTHORIZATION",
+            action_digest: Some(action_digest),
             is_error: false,
         })
+    }
+
+    /// Implements Domain Risk Mapping for neural model failure, high uncertainty, or unclassified actions:
+    /// - High-risk / mutating operations (shell execution, file writes/deletes) fail closed (DENY).
+    /// - Read-only / low-risk operations escalate to human authorization (REQUIRE_AUTHORIZATION).
+    pub fn fallback_domain_decision(
+        &self,
+        req: &DecisionRequest,
+        ws: Option<&Path>,
+        reason: &str,
+    ) -> DecisionResponse {
+        let is_shell_tool = is_shell_execution_tool(&req.tool);
+        let is_file_tool = is_file_mutation_tool(&req.tool);
+        let action_digest = req.compute_action_digest(ws);
+
+        if is_shell_tool || is_file_tool {
+            let mut prob_map = HashMap::new();
+            prob_map.insert("DENY".to_string(), 1.0);
+            prob_map.insert("ALLOW".to_string(), 0.0);
+            prob_map.insert("REQUIRE_AUTHORIZATION".to_string(), 0.0);
+
+            DecisionResponse {
+                version: Some("1.0".to_string()),
+                decision: "DENY".to_string(),
+                reasoning: Some(format!("Neural model unavailable or uncertain on mutating action (fail-closed): {}.", reason)),
+                probability: Some(1.0),
+                probabilities: Some(prob_map),
+                matched_rule: Some("DOMAIN_RISK_FAIL_CLOSED".to_string()),
+                risk_category: Some(if is_shell_tool { "shell_execution".to_string() } else { "filesystem_mutation".to_string() }),
+                enforcement_action: Some("block".to_string()),
+                tier: Some(PolicyTier::Tier2NeuralRiskAssessment.as_str().to_string()),
+                temperature: Some(1.0),
+                logits: None,
+                approval_required: false,
+                action_digest: Some(action_digest),
+                is_error: false,
+            }
+        } else {
+            let mut prob_map = HashMap::new();
+            prob_map.insert("DENY".to_string(), 0.0);
+            prob_map.insert("ALLOW".to_string(), 0.0);
+            prob_map.insert("REQUIRE_AUTHORIZATION".to_string(), 1.0);
+
+            DecisionResponse {
+                version: Some("1.0".to_string()),
+                decision: "REQUIRE_AUTHORIZATION".to_string(),
+                reasoning: Some(format!("Neural model unavailable or uncertain on non-mutating action: {}; escalated to human authorization.", reason)),
+                probability: Some(1.0),
+                probabilities: Some(prob_map),
+                matched_rule: Some("DOMAIN_RISK_ESCALATION".to_string()),
+                risk_category: Some("low_risk_action".to_string()),
+                enforcement_action: Some("prompt_user".to_string()),
+                tier: Some(PolicyTier::Tier2NeuralRiskAssessment.as_str().to_string()),
+                temperature: Some(1.0),
+                logits: None,
+                approval_required: true,
+                action_digest: Some(action_digest),
+                is_error: false,
+            }
+        }
     }
 }
 

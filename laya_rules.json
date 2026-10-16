@@ -15,6 +15,24 @@
       "commandPattern": "^git[ \\t]+branch([ \\t]+(-[alr]+|--list|--show-current|--all|--remotes))?$"
     },
     {
+      "id": "allow-cargo-dev-queries",
+      "action": "ALLOW",
+      "tool": "(laya_)?(run_command|Bash|terminal|shell|execute_command)",
+      "commandPattern": "^cargo[ \\t]+(check|test|clippy|build|fmt|status)([ \\t]+[^;&|`$()<>\r\n]*)?$"
+    },
+    {
+      "id": "allow-node-dev-queries",
+      "action": "ALLOW",
+      "tool": "(laya_)?(run_command|Bash|terminal|shell|execute_command)",
+      "commandPattern": "^(npm|pnpm|yarn|bun)[ \\t]+(test|run[ \\t]+(test|lint|typecheck|build))([ \\t]+[^;&|`$()<>\r\n]*)?$"
+    },
+    {
+      "id": "allow-python-test-queries",
+      "action": "ALLOW",
+      "tool": "(laya_)?(run_command|Bash|terminal|shell|execute_command)",
+      "commandPattern": "^(pytest|python3?[ \\t]+-m[ \\t]+(unittest|pytest))([ \\t]+[^;&|`$()<>\r\n]*)?$"
+    },
+    {
       "id": "allow-workspace-reads",
       "action": "ALLOW",
       "tool": "^(view_file|read_file|laya_read_file|read_files|laya_read_files|Read|Grep|Glob|LS|search_files|list_dir|listdir|ls)$",

@@ -37,6 +37,7 @@ pub fn run_install(bin_dir: Option<PathBuf>, force: bool) -> Result<()> {
         .ok()
         .map(PathBuf::from)
         .into_iter()
+        .chain(std::env::current_dir().ok().into_iter())
         .chain(std::env::current_exe().ok().into_iter().flat_map(|p| {
             p.ancestors().skip(1).take(3).map(|a| a.to_path_buf()).collect::<Vec<_>>()
         }))
@@ -251,17 +252,57 @@ commandPattern = ".*(kubectl|docker\\s+push|helm|terraform).*"
 
     // 5. Check and configure host integrations
     println!("\n[5/5] Host coding tool hook adapters");
+    let adapters_dst = config_dir.join("adapters");
+    let _ = fs::create_dir_all(&adapters_dst);
+    if let Some(ref root) = repo_root {
+        let adapters_src = root.join("adapters");
+        if adapters_src.exists() {
+            let _ = fs::create_dir_all(adapters_dst.join("common"));
+            let _ = fs::copy(adapters_src.join("common").join("laya_client.js"), adapters_dst.join("common").join("laya_client.js"));
+
+            let _ = fs::create_dir_all(adapters_dst.join("antigravity"));
+            let _ = fs::copy(adapters_src.join("antigravity").join("hook.js"), adapters_dst.join("antigravity").join("hook.js"));
+
+            let _ = fs::create_dir_all(adapters_dst.join("claude-code"));
+            let _ = fs::copy(adapters_src.join("claude-code").join("hook.js"), adapters_dst.join("claude-code").join("hook.js"));
+
+            let _ = fs::create_dir_all(adapters_dst.join("cursor"));
+            let _ = fs::copy(adapters_src.join("cursor").join("hook.js"), adapters_dst.join("cursor").join("hook.js"));
+
+            let laya_run_src = adapters_src.join("generic-cli").join("laya-run");
+            let laya_run_dst = target_bin_dir.join("laya-run");
+            if laya_run_src.exists() {
+                let _ = fs::copy(&laya_run_src, &laya_run_dst);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = fs::set_permissions(&laya_run_dst, fs::Permissions::from_mode(0o755));
+                }
+                println!("  [✓] Installed CLI wrapper: {}", laya_run_dst.display());
+            }
+
+            println!("  [✓] Provisioned universal adapters: {}", adapters_dst.display());
+        }
+    }
+
     let ag_dir = home.join(".gemini").join("antigravity-cli");
     if ag_dir.exists() {
         let hooks_dir = ag_dir.join("hooks");
         let _ = fs::create_dir_all(&hooks_dir);
         let dst_hook = hooks_dir.join("laya-pretool-hook.js");
-        if let Some(ref root) = repo_root {
-            let src_hook = root.join("hooks").join("laya-pretool-hook.js");
-            if src_hook.exists() && (!dst_hook.exists() || force) {
-                let _ = fs::copy(&src_hook, &dst_hook);
-                println!("  [✓] Installed Antigravity hook adapter to {}", dst_hook.display());
+        let target_hook = adapters_dst.join("antigravity").join("hook.js");
+        let wrapper_content = format!(
+            "#!/usr/bin/env node\n// Auto-generated Laya Antigravity Hook Loader\nrequire('{}');\n",
+            target_hook.display()
+        );
+        if !dst_hook.exists() || force {
+            let _ = fs::write(&dst_hook, wrapper_content);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = fs::set_permissions(&dst_hook, fs::Permissions::from_mode(0o755));
             }
+            println!("  [✓] Configured Antigravity hook adapter at {}", dst_hook.display());
         }
     }
 

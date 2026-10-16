@@ -58,42 +58,56 @@ async function main() {
     try {
         const decision = await queryLayaPolicy(toolName, operation, workspace, toolArgs);
 
-        switch (decision.enforcement_action) {
-            case 'execute':
-                // Allowed: if read operation, exit 0 silently; otherwise emit allow
-                if (operation === 'read') {
-                    process.exit(0);
-                }
-                console.log(JSON.stringify({ permissionDecision: 'allow' }));
+        const isDeny = decision.decision === 'DENY' || decision.enforcement_action === 'block';
+        const isAuthRequired = decision.decision === 'REQUIRE_AUTHORIZATION' || decision.approval_required === true || decision.enforcement_action === 'prompt_user';
+
+        if (isDeny) {
+            console.log(JSON.stringify({
+                permissionDecision: 'deny',
+                reason: decision.reasoning || 'Blocked by Laya security policy',
+                ruleId: decision.matched_rule,
+                tier: decision.tier,
+                actionDigest: decision.action_digest,
+            }));
+            process.exit(0);
+        } else if (isAuthRequired) {
+            console.log(JSON.stringify({
+                permissionDecision: 'ask',
+                reason: decision.reasoning || 'Laya policy requires interactive human authorization',
+                riskCategory: decision.risk_category || 'general',
+                ruleId: decision.matched_rule,
+                tier: decision.tier,
+                actionDigest: decision.action_digest,
+            }));
+            process.exit(0);
+        } else {
+            // Allowed: if read operation, exit 0 silently; otherwise emit allow
+            if (operation === 'read') {
                 process.exit(0);
-                break;
-            case 'prompt_user':
-                console.log(JSON.stringify({
-                    permissionDecision: 'ask',
-                    reason: decision.reasoning || 'Laya policy requires interactive human authorization',
-                    riskCategory: decision.risk_category || 'general',
-                    tier: decision.tier,
-                }));
-                process.exit(0);
-                break;
-            case 'block':
-            default:
-                console.log(JSON.stringify({
-                    permissionDecision: 'deny',
-                    reason: decision.reasoning || 'Blocked by Laya security policy',
-                    ruleId: decision.matched_rule,
-                    tier: decision.tier,
-                }));
-                process.exit(0);
-                break;
+            }
+            console.log(JSON.stringify({
+                permissionDecision: 'allow',
+                actionDigest: decision.action_digest,
+            }));
+            process.exit(0);
         }
     } catch (err) {
-        // Fail closed on error for non-readonly operations
-        console.log(JSON.stringify({
-            permissionDecision: 'ask',
-            reason: `Laya Policy Engine offline or error: ${err.message}. Prompting user for safety.`,
-        }));
-        process.exit(0);
+        // Domain Risk Mapping on offline/unreachable:
+        // Mutating/shell operations fail closed to deny, read operations prompt user
+        const isMutating = operation === 'write' || operation === 'delete' || operation === 'execute';
+        if (isMutating) {
+            console.log(JSON.stringify({
+                permissionDecision: 'deny',
+                reason: `Laya Policy Engine unreachable for mutating operation '${operation}': ${err.message}. Blocked by fail-closed domain policy.`,
+            }));
+            process.exit(0);
+        } else {
+            console.log(JSON.stringify({
+                permissionDecision: 'ask',
+                reason: `Laya Policy Engine unreachable for read operation '${operation}': ${err.message}. Prompting user for safety.`,
+            }));
+            process.exit(0);
+        }
     }
 }
 

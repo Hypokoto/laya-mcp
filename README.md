@@ -126,7 +126,19 @@ Connect your harness using:
 - **URL:** `http://127.0.0.1:3000/sse`
 - **Header:** `Authorization: Bearer <LAYA_API_TOKEN>`
 
-### Alternative: Rootless Sandboxed Execution (Podman / Docker)
+### Alternative: Zero-Root Unprivileged Sandbox (Bubblewrap)
+
+To run arbitrary untrusted commands, tests, or package scripts with read-only root filesystems, shadowed credentials, and unshared namespaces:
+
+```bash
+# Run tests offline in isolated sandbox
+./scripts/laya-sandbox.sh --offline -- cargo test
+
+# Run untrusted commands with ~/.ssh and ~/.aws masked
+./scripts/laya-sandbox.sh -- npm test
+```
+
+### Alternative: Rootless Container Execution (Podman / Docker)
 
 To run the MCP server with dropped capabilities, no new privileges, and isolated workspace mounts:
 
@@ -136,28 +148,33 @@ To run the MCP server with dropped capabilities, no new privileges, and isolated
 
 ---
 
-## 4. Hardcoded Harness Interceptor (PreToolUse Hook)
+## 4. Universal Host Adapters & Hooks
 
-Want Laya to actively guard your AI agents *before* any command executes, without relying on the model remembering to call an MCP tool?
+Want Laya to actively guard your AI agents *before* any command executes, across any coding tool?
 
-Laya includes a universal **PreToolUse decision hook** (`hooks/laya-pretool-hook.js`) compatible with Antigravity, Cursor, and Claude Code:
+Laya provides dedicated, hardened host adapters under `adapters/` supporting:
+- **Antigravity CLI & IDE** (`adapters/antigravity/hook.js`)
+- **Claude Code CLI** (`adapters/claude-code/hook.js`)
+- **Cursor IDE** (`adapters/cursor/hook.js`)
+- **Generic CLI & Shell Wrapper** (`adapters/generic-cli/laya-run` -> `laya-run <command>`)
 
-- **0ms Fast-Path:** Non-mutating tools (`view_file`, `Read`, `read_file`, `Grep`, `Glob`, `LS`, `search_web`, `read_url_content`, etc.) pass through immediately with zero overhead.
-- **Pre-Execution Guardrails:** Mutating commands (`run_command`, `Bash`, `write_to_file`, `replace_file_content`, `Edit`) are intercepted before execution and evaluated against the calibrated Laya ONNX decision model.
-- **Interactive Escalation:** Actions requiring human confirmation return native `permissionDecision: "ask"` for Claude Code, prompting you interactively in the terminal rather than blocking indefinitely.
-- **Hard Block Policy:** Destructive commands (e.g. `rm -rf /`, `rm -rf ./*`, `git push --force`) exit with code `2` or return `permissionDecision: "deny"`, halting execution dead in its tracks.
-- **Emergency Escape Hatch:** If the local runtime is offline and you need to bypass interception immediately:
-  ```bash
-  cd laya-mcp && npm run hook:uninstall
-  ```
+### Core Adapter Features:
+- **0ms Fast-Path:** Non-mutating read-only tools (`view_file`, `Read`, `read_file`, `Grep`, `Glob`, `LS`, `search_web`, `read_url_content`) pass through immediately with zero overhead.
+- **Cryptographic Action Digests:** Computes deterministic SHA-256 digests over `(tool, workspace, arguments)` ensuring approved actions match executed actions bit-for-bit.
+- **Anti-Replay & Anti-Substitution:** Approval receipts use single-use nonces to eliminate replay and post-approval argument alteration attacks.
+- **Local IPC Chain:** Queries Unix Domain Socket (`0600` mode with `SO_PEERCRED` UID caller validation, `<0.5ms`) $\rightarrow$ Loopback TCP HTTP (with 256-bit bearer token, `~1ms`) $\rightarrow$ CLI Subprocess fallback (`~25ms`).
+- **Domain Risk Mapping:** If the engine is offline, mutating actions fail closed (`DENY`), while read actions escalate to human approval (`REQUIRE_AUTHORIZATION`).
 
-### Install or Uninstall Hook
+### Installation
 ```bash
-cd laya-mcp
-npm run hook:install     # Registers hook in Claude Code, Cursor, and Antigravity
-npm run hook:uninstall   # Safely unregisters hook (with .bak backups preserved)
-npm run test:hook        # Runs automated hook test suite
+# Provision binaries, global configs, and adapters automatically:
+laya install --force
+
+# Verify local environment, sockets, and adapter status:
+laya doctor
 ```
+
+For complete security boundaries and threat model details, see [docs/SECURITY_MODEL.md](docs/SECURITY_MODEL.md).
 
 ---
 
@@ -179,9 +196,12 @@ ln -sfn $(pwd)/skills/laya-code-analysis ~/.gemini/config/skills/laya-code-analy
 
 ## 6. Automated Verification
 
-Run the full handshake, 10-question evaluation, and hook test suites:
+Run the full Rust workspace tests and the 11-suite Universal Adapter Conformance battery:
 
 ```bash
-cd laya-mcp
-npm test
+# 1. Rust unit tests (types, policy precedence, token auth, peer credentials)
+cargo test --workspace
+
+# 2. Node adapter conformance, security, and adversarial suite (54 automated tests)
+node --test tests/adapters_test.ts
 ```

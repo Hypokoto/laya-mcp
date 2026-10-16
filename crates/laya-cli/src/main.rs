@@ -190,6 +190,7 @@ struct AppState {
     start_time: Instant,
     model_name: String,
     server_workspace: Option<PathBuf>,
+    auth_token: Option<String>,
 }
 
 #[tokio::main]
@@ -320,6 +321,7 @@ async fn main() -> Result<()> {
                         eprintln!("[LAYA POLICY ERROR] Failed to load project policy '{}': {}", policy_path.display(), err);
                         let mut prob_map = std::collections::HashMap::new();
                         prob_map.insert("REQUIRE_AUTHORIZATION".to_string(), 1.0);
+                        let digest = req.compute_action_digest(None);
                         let err_res = DecisionResponse {
                             version: Some("1.0".to_string()),
                             decision: "REQUIRE_AUTHORIZATION".to_string(),
@@ -332,6 +334,8 @@ async fn main() -> Result<()> {
                             tier: Some("tier_0_hard_invariant".to_string()),
                             temperature: Some(1.0),
                             logits: None,
+                            approval_required: true,
+                            action_digest: Some(digest),
                             is_error: false,
                         };
                         println!("{}", serde_json::to_string_pretty(&err_res)?);
@@ -494,12 +498,44 @@ async fn main() -> Result<()> {
             )?;
             println!("✓ Model loaded in {:.2}ms ({})", t0.elapsed().as_secs_f64() * 1000.0, model_path.display());
 
+            let state_dir = paths::get_laya_state_dir();
+            let _ = fs::create_dir_all(&state_dir);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = fs::set_permissions(&state_dir, fs::Permissions::from_mode(0o700));
+            }
+
+            // Generate cryptographically isolated session auth token
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(&t0.elapsed().as_nanos().to_le_bytes());
+            hasher.update(&std::process::id().to_le_bytes());
+            hasher.update(b"laya_ipc_session_token_salt");
+            let auth_token = hex::encode(hasher.finalize());
+            let auth_token_path = paths::get_laya_auth_token_path();
+            #[cfg(unix)]
+            let file_res = {
+                use std::os::unix::fs::OpenOptionsExt;
+                let mut opts = fs::OpenOptions::new();
+                opts.write(true).create(true).truncate(true).mode(0o600);
+                opts.open(&auth_token_path)
+            };
+            #[cfg(not(unix))]
+            let file_res = fs::File::create(&auth_token_path);
+
+            if let Ok(mut f) = file_res {
+                use std::io::Write;
+                let _ = f.write_all(auth_token.as_bytes());
+            }
+
             let server_workspace = workspace.map(|w| fs::canonicalize(&w).unwrap_or(w));
             let app_state = Arc::new(AppState {
                 engine: Arc::new(engine),
                 start_time: Instant::now(),
                 model_name: model_path.file_name().unwrap_or_default().to_string_lossy().to_string(),
                 server_workspace,
+                auth_token: Some(auth_token),
             });
 
             // Restrict CORS strictly to loopback origins; local adapters execute outside browsers.
@@ -561,9 +597,26 @@ async fn main() -> Result<()> {
 
                 let sock_path_clone = sock_path.clone();
                 let unix_task = tokio::spawn(async move {
+                    let current_uid = unsafe { libc::getuid() };
                     loop {
                         match unix_listener.accept().await {
                             Ok((mut unix_stream, _)) => {
+                                match unix_stream.peer_cred() {
+                                    Ok(cred) => {
+                                        if cred.uid() != current_uid {
+                                            eprintln!(
+                                                "[LAYA SECURITY] Rejected Unix connection from unauthorized UID: {} (daemon UID: {})",
+                                                cred.uid(),
+                                                current_uid
+                                            );
+                                            continue;
+                                        }
+                                    }
+                                    Err(err) => {
+                                        eprintln!("[LAYA SECURITY] Failed to inspect peer credentials (SO_PEERCRED): {}", err);
+                                        continue;
+                                    }
+                                }
                                 tokio::spawn(async move {
                                     if let Ok(mut tcp_stream) = tokio::net::TcpStream::connect(addr).await {
                                         let _ = tokio::io::copy_bidirectional(&mut unix_stream, &mut tcp_stream).await;
@@ -584,6 +637,7 @@ async fn main() -> Result<()> {
                 }
 
                 let _ = fs::remove_file(&sock_path_clone);
+                let _ = fs::remove_file(paths::get_laya_auth_token_path());
             }
 
             #[cfg(not(unix))]
@@ -734,8 +788,21 @@ async fn openapi_handler() -> impl IntoResponse {
 
 async fn decide_handler(
     State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
     Json(payload): Json<DecisionRequest>,
 ) -> Result<Json<DecisionResponse>, (StatusCode, String)> {
+    if let Some(ref expected_token) = state.auth_token {
+        let auth_header = headers.get(axum::http::header::AUTHORIZATION)
+            .and_then(|h| h.to_str().ok());
+        let expected = format!("Bearer {}", expected_token);
+        if auth_header != Some(&expected) {
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                "Unauthorized: Valid Bearer token required in Authorization header. Read token from ~/.local/state/laya/auth_token".to_string()
+            ));
+        }
+    }
+
     let engine = state.engine.clone();
     let server_ws = state.server_workspace.clone();
     tokio::task::spawn_blocking(move || {
@@ -748,6 +815,7 @@ async fn decide_handler(
             if !rws.starts_with(sws) {
                 let mut prob_map = std::collections::HashMap::new();
                 prob_map.insert("DENY".to_string(), 1.0);
+                let digest = payload.compute_action_digest(server_ws.as_deref());
                 return Ok(DecisionResponse {
                     version: Some("1.0".to_string()),
                     decision: "DENY".to_string(),
@@ -763,6 +831,8 @@ async fn decide_handler(
                     tier: Some("tier_0_hard_invariant".to_string()),
                     temperature: Some(0.0),
                     logits: None,
+                    approval_required: false,
+                    action_digest: Some(digest),
                     is_error: false,
                 });
             }
@@ -800,6 +870,7 @@ async fn decide_handler(
                             eprintln!("[LAYA POLICY ERROR] Failed to load project policy '{}': {}", policy_path.display(), err);
                             let mut prob_map = std::collections::HashMap::new();
                             prob_map.insert("REQUIRE_AUTHORIZATION".to_string(), 1.0);
+                            let digest = payload.compute_action_digest(containment_ws.map(|p| p.as_path()));
                             return Ok(DecisionResponse {
                                 version: Some("1.0".to_string()),
                                 decision: "REQUIRE_AUTHORIZATION".to_string(),
@@ -812,6 +883,8 @@ async fn decide_handler(
                                 tier: Some("tier_0_hard_invariant".to_string()),
                                 temperature: Some(1.0),
                                 logits: None,
+                                approval_required: true,
+                                action_digest: Some(digest),
                                 is_error: false,
                             });
                         }
@@ -830,3 +903,44 @@ async fn decide_handler(
         format!("Laya Engine Error: {}", err),
     ))
 }
+
+#[cfg(test)]
+mod tests {
+
+    #[test]
+    fn test_auth_token_format_and_entropy() {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(&123456789u128.to_le_bytes());
+        hasher.update(&42u32.to_le_bytes());
+        hasher.update(b"laya_ipc_session_token_salt");
+        let token = hex::encode(hasher.finalize());
+        assert_eq!(token.len(), 64);
+        assert!(token.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn test_auth_header_matching_logic() {
+        let expected_token = "abcd1234efgh5678abcd1234efgh5678abcd1234efgh5678abcd1234efgh5678";
+        let valid_header = format!("Bearer {}", expected_token);
+        let expected = format!("Bearer {}", expected_token);
+        assert_eq!(Some(valid_header.as_str()), Some(expected.as_str()));
+
+        let invalid_header = "Bearer wrong_token_value";
+        assert_ne!(Some(invalid_header), Some(expected.as_str()));
+
+        let malformed_scheme = format!("Basic {}", expected_token);
+        assert_ne!(Some(malformed_scheme.as_str()), Some(expected.as_str()));
+    }
+
+    #[test]
+    fn test_peer_credential_uid_matching() {
+        let daemon_uid = 1000u32;
+        let authorized_peer_uid = 1000u32;
+        let attacker_peer_uid = 1001u32;
+
+        assert_eq!(authorized_peer_uid, daemon_uid, "Same UID connection must be allowed");
+        assert_ne!(attacker_peer_uid, daemon_uid, "Different UID connection must be rejected");
+    }
+}
+

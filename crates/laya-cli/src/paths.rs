@@ -28,6 +28,10 @@ pub fn get_laya_socket_path() -> PathBuf {
     get_laya_state_dir().join("laya.sock")
 }
 
+pub fn get_laya_auth_token_path() -> PathBuf {
+    get_laya_state_dir().join("auth_token")
+}
+
 pub fn resolve_default_paths(
     cli_model: Option<PathBuf>,
     cli_tokenizer: Option<PathBuf>,

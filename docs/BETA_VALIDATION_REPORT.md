@@ -64,6 +64,22 @@ Latency Profile (IPC + Policy Engine):
 | **IPC + Engine Latency ($p_{50}$)** | $\le 50\text{ ms}$ | **16.25 ms** | **PASS** | Fast-path queries resolve in $<2\text{ ms}$; full ModernBERT ONNX inference averages $\approx 160\text{--}190\text{ ms}$. |
 | **IPC + Engine Latency ($p_{90}$)** | $\le 300\text{ ms}$ | **206.06 ms** | **PASS** | Even worst-case AST + neural evaluations execute within interactive human tolerance limits. |
 
+### Latency Profile Disaggregation & Tail-Latency Root Cause
+
+The raw test battery pools both **warm IPC queries** and **cold subprocess initialization tests**. Disaggregating these measurements clarifies operational behavior:
+
+| Execution Context | Sample Count | $p_{50}$ (Median) | $p_{90}$ | $p_{95}$ | Max | Root Cause & Operational Impact |
+| :--- | :---: | :---: | :---: | :---: | :---: | :--- |
+| **Warm Operational IPC** (Workflows 1–25, Anti-Replay 1–10, Sandbox 1–9, SO_PEERCRED) | **55** | **15.89 ms** | **172.24 ms** | **183.77 ms** | **206.06 ms** | Real-world interactive coding latency. Fast-path regex rules resolve in $0.5\text{--}15\text{ ms}$; ModernBERT INT8 neural inference resolves in $160\text{--}205\text{ ms}$. Zero warm operational queries exceeded $206.06\text{ ms}$. |
+| **Cold Subprocess & Lifecycle Tests** (Tests 2.10, 4.1, 4.2, 4.3, 4.4) | **5** | **1,306.48 ms** | **1,706.65 ms** | **1,706.91 ms** | **1,706.91 ms** | Subprocess harness overhead: Spawning cold `laya` CLI and `laya serve` instances initializes the ONNX runtime from disk ($\sim 1,250\text{ ms}$ model load) and waits on signal sleep timers ($400\text{ ms}$). |
+| **Combined Aggregate Battery** | **60** | **16.25 ms** | **206.06 ms** | **1,441.01 ms** | **1,706.91 ms** | Conflates one-off daemon startup with warm query throughput. |
+
+#### Formal Milestone 3 Tail-Latency Targets (Performance Budget)
+- **Deterministic Rule Fast-Path ($p_{95}$):** $\le 5\text{ ms}$
+- **Warm IPC Neural Inference ($p_{95}$):** $\le 225\text{ ms}$
+- **Overall Warm Operational Tail ($p_{95}$):** $\le 200\text{ ms}$
+- **Cold Subprocess Startup ($p_{95}$):** $\le 1,500\text{ ms}$ (non-blocking for background daemon)
+
 ---
 
 ## 3. Detailed Battery Results by Category
@@ -99,7 +115,7 @@ Verifies sandbox isolation provided by `scripts/laya-sandbox.sh` (Bubblewrap har
 7. **Binary System Immutability:** Writing to `/usr/bin` blocked with `Read-only file system` error ($15.94\text{ ms}$).
 8. **User Directory Containment:** Writing to host home outside designated workspace blocked ($16.25\text{ ms}$).
 9. **Designated Workspace Writable:** Target workspace `/tmp/laya_beta_disposable_project` verified read-write for builds ($21.38\text{ ms}$).
-10. **Symlink Escape Traversal:** Symlink pointing to `/etc` evaluated and flagged by policy engine as `REQUIRE_AUTHORIZATION` ($1441\text{ ms}$).
+10. **Symlink Escape Traversal:** Symlink pointing to `/etc` evaluated and flagged by policy engine as `REQUIRE_AUTHORIZATION` ($1441\text{ ms}$ cold CLI invocation). **Important qualification:** This demonstrates pre-tool policy escalation (flagging to human approval); physical filesystem escape prevention is separately and decisively enforced by Bubblewrap mounting host root read-only (`--ro-bind / /`) and shadowing credentials.
 
 ### Category 4: Priority 3 — Sandbox Boundary & Kernel Isolation (8 Scenarios)
 1. **Outbound Network Containment:** `curl -m 2 https://1.1.1.1` under `--offline` failed immediately ($22.44\text{ ms}$).
@@ -128,8 +144,8 @@ To ensure responsible operational deployment, beta operators must adhere to thes
 
 1. **Host Integration Tiers:**
    - **Antigravity CLI / IDE (Tier 1):** Fully live-tested with native PreToolUse interception and stderr feedback.
-   - **Claude Code CLI (Tier 2):** Protocol-tested against RFC mock harness (`permissionDecision: allow|ask|deny`).
-   - **Cursor IDE (Tier 3):** Protocol-tested via hook input/output contract.
+   - **Claude Code CLI (Tier 2):** Protocol-tested against RFC mock harness (`permissionDecision: allow|ask|deny`). Live interactive session verification scheduled for Milestone 3.
+   - **Cursor IDE (Tier 3):** Protocol-tested via hook input/output contract. Live interactive session verification scheduled for Milestone 3.
    - **Other / Uninstrumented Tools (Tier 4):** Laya provides **zero protection** for actions executed outside supported hook adapters.
 
 2. **OS Sandbox Boundaries (Bubblewrap):**
@@ -140,6 +156,10 @@ To ensure responsible operational deployment, beta operators must adhere to thes
 3. **Approval Scope:**
    - Cryptographic action binding guarantees that an approved tool request cannot be tampered with prior to dispatch.
    - It does **not** monitor child processes spawned after execution begins unless executed within the sandbox harness.
+
+4. **Symlink Traversal & Advisory Gate Limitations:**
+   - Pre-tool policy inspection operates on structured command arguments and detects symlinks escaping the workspace, escalating to `REQUIRE_AUTHORIZATION`.
+   - This escalation is an **advisory authorization gate**, not a physical filesystem barrier. If authorized by a user, or if an action bypasses pre-tool parsing, escape prevention depends entirely on the Bubblewrap sandbox mounting the host root read-only. Containment limitations must remain documented.
 
 ---
 
@@ -170,3 +190,36 @@ $ node --test tests/adapters_test.ts
 1. Keep architecture frozen at tag [`v0.1.0-beta.1`](https://github.com/Hypokoto/laya-mcp/releases/tag/v0.1.0-beta.1).
 2. Direct all untrusted repository execution through `scripts/laya-sandbox.sh`.
 3. Capture operational metrics and false/missed denials in GitHub Discussions/Issues using the v0.1.0-beta.1 template.
+
+---
+
+## 7. Roadmap to Stable Release: Milestone 3 & Beyond
+
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│                        RELEASE PROGRESSION ROADMAP                     │
+├────────────────────────────────────────────────────────────────────────┤
+│  [✓] Milestone 1: Architecture Freeze & Beta Release (v0.1.0-beta.1)   │
+│  [✓] Milestone 2: Initial Empirical & Adversarial Validation (141/141) │
+│  [▶] Milestone 3: Sustained Beta Reliability & Integration Validation   │
+│  [ ] Milestone 4: Release-Readiness Review                             │
+│  [ ] Milestone 5: Stable-Release Decision (v0.1.0 GA)                  │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+### Milestone 3 Workstreams (Active):
+1. **Sustained Operational Beta:**
+   - Deploy Laya on real, multi-day development workloads beyond disposable test workspaces.
+   - Monitor and log operational metrics: false-denial rate, missed-denial rate, daemon memory stability, uptime, crash recovery.
+2. **Live Host Integration Verification:**
+   - Transition Claude Code and Cursor integrations from *protocol-tested* (mock harness) to *live-tested* in actual interactive agent sessions.
+   - Verify PreToolUse blocking, interactive ask prompts, and terminal feedback under real developer CLI use.
+3. **Tail-Latency Enforcement:**
+   - Enforce explicit performance targets under production loads:
+     - Warm IPC deterministic rule fast-path ($p_{95}$): $\le 5\text{ ms}$.
+     - Warm IPC neural inference ($p_{95}$): $\le 225\text{ ms}$.
+     - Combined warm operational tail ($p_{95}$): $\le 200\text{ ms}$.
+     - Background daemon initialization ($p_{95}$): $\le 1,500\text{ ms}$.
+4. **Advisory & Containment Boundary Verification:**
+   - Validate that pre-tool policy warnings consistently trigger sandbox containment for untrusted repositories.
+
